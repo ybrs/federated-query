@@ -24,6 +24,7 @@ pub mod connectors;
 pub mod core;
 pub mod engine;
 pub mod error;
+mod json;
 mod list_expansion;
 mod unnest;
 

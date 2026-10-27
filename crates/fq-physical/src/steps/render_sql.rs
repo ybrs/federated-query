@@ -5,8 +5,8 @@
 //! `_grouped_limit_sql`, `_render_values_sql`).
 //!
 //! DIALECT: a scan renders to its SOURCE dialect (from the scan's
-//! `datasource_kind`); the merge raw-SQL strings render to `DuckDb` (the merge
-//! engine's dialect, matching the Python `dialect="duckdb"`).
+//! `datasource_kind`); the merge raw-SQL strings render to DataFusion (the merge
+//! engine's dialect).
 
 use fq_common::DataType;
 use fq_emit::clauses::{
@@ -242,7 +242,7 @@ fn scan_select_items(scan: &PhysicalScan) -> Result<String, StepError> {
 
 /// Render `SELECT <exprs> AS <names> FROM in_window` for the merge engine. Ports
 /// `PhysicalWindow._window_sql`; columns resolve to physical merge names, the whole
-/// expression (window included) transpiles to DuckDb.
+/// expression (window included) transpiles to DataFusion.
 pub fn render_window_sql(
     node: &PhysicalWindow,
     aliases: &ColumnAliasMap,
@@ -251,7 +251,7 @@ pub fn render_window_sql(
     let exprs = cast_avg_exprs(&node.expressions);
     let items = select_list(&exprs, &node.output_names, &resolver)?;
     let sql = format!("SELECT {items} FROM {MERGE_WINDOW_RELATION}");
-    Ok(to_source_sql(&sql, Dialect::DuckDb)?)
+    Ok(to_source_sql(&sql, Dialect::DataFusion)?)
 }
 
 /// The merge SELECT expressions with every coordinator `avg(decimal)` argument cast
@@ -334,7 +334,7 @@ fn render_grouped_select(
     if let Some(group) = group_by(keys, grouping_sets, &resolver)? {
         sql = format!("{sql} GROUP BY {group}");
     }
-    Ok(to_source_sql(&sql, Dialect::DuckDb)?)
+    Ok(to_source_sql(&sql, Dialect::DataFusion)?)
 }
 
 /// The two-stage SQL for a window over a GROUPING() aggregate (the DataFusion
@@ -508,7 +508,7 @@ fn render_stage2_window(
     let select = select_list(&cast_items, output_names, &resolver)?;
     Ok(to_source_sql(
         &format!("SELECT {select} FROM {MERGE_AGGREGATE_RELATION}"),
-        Dialect::DuckDb,
+        Dialect::DataFusion,
     )?)
 }
 
@@ -546,7 +546,7 @@ pub fn render_grouped_limit_sql(
         node.limit,
         quote_ident(GROUPED_LIMIT_INDEX_COL)
     );
-    Ok(to_source_sql(&node_sql, Dialect::DuckDb)?)
+    Ok(to_source_sql(&node_sql, Dialect::DataFusion)?)
 }
 
 /// The PARTITION BY list of a grouped-limit window, each key rendered against the
@@ -596,7 +596,7 @@ pub fn render_values_sql(rows: &[Vec<Expr>], names: &[String]) -> Result<String,
         tuples.join(", "),
         columns
     );
-    Ok(to_source_sql(&sql, Dialect::DuckDb)?)
+    Ok(to_source_sql(&sql, Dialect::DataFusion)?)
 }
 
 /// One VALUES row rendered as `(c0, c1, ...)`; every cell must be a literal.

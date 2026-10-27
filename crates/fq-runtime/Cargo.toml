@@ -33,6 +33,8 @@ fq-events = { path = "../fq-events" }
 fq-scram = { path = "../fq-scram" }
 # Structured audit lines (auth, DDL, denied access) go to the server log.
 tracing = "0.1"
+# State-file header reads use SQLite's VFS so descriptor closes preserve its locks.
+rusqlite = { version = "0.32", features = ["bundled"] }
 # The result rename rebuilds the final RecordBatch/Schema under user-visible names.
 arrow = "58"
 # Datasource connection params arrive as raw YAML values on DataSourceConfig.

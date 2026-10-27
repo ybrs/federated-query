@@ -22,7 +22,7 @@ use fq_exec::connectors;
 
 use crate::error::RuntimeError;
 use crate::materialized::status_result;
-use crate::Runtime;
+use crate::{QueryPurpose, Runtime};
 
 /// The lazily opened event store shared by a runtime's statements.
 pub(crate) type EventStoreSlot = Mutex<Option<Arc<EventStore>>>;
@@ -63,6 +63,40 @@ impl Runtime {
         )?);
         *slot = Some(Arc::clone(&store));
         Ok(store)
+    }
+
+    /// Plan and bind once, streaming a native source or executing the general query plan.
+    fn event_select_source(&self, sql: &str) -> Result<Box<dyn BatchSource>, RuntimeError> {
+        let (physical, _) = self.plan_inner(sql, QueryPurpose::EventSource)?;
+        if let Some(source) = self.native_select_stream(&physical)? {
+            return Ok(source);
+        }
+        let (_, batches) = self.execute_source_plan(&physical)?;
+        Ok(Box::new(ReplaySource {
+            batches: batches.into_iter(),
+        }))
+    }
+
+    /// Use the source's real rendered SQL only after normal binding and plan validation.
+    fn native_select_stream(
+        &self,
+        physical: &fq_plan::PhysicalPlan,
+    ) -> Result<Option<Box<dyn BatchSource>>, RuntimeError> {
+        let fq_plan::PhysicalPlan::RemoteQuery(query) = physical else {
+            return Ok(None);
+        };
+        let datasource = self
+            .catalog_snapshot()
+            .get_datasource(&query.datasource)
+            .expect("planned datasource exists");
+        if datasource.render_dialect() != fq_catalog::RenderDialect::Parquet {
+            return Ok(None);
+        }
+        let _scope = connectors::SessionScope::enter(self.exec_session());
+        let stream = connectors::fetch_stream(&query.datasource, &query.sql)?;
+        let source = Box::new(StreamSource::new(stream, None));
+        let names = fq_plan::physical::visible_output_names(physical);
+        Ok(Some(crate::source_stream::rename(source, names)))
     }
 
     /// `CREATE EVENT DATASET`: resolve and validate the source, stream its
@@ -107,7 +141,7 @@ impl Runtime {
                             .to_string(),
                     ));
                 }
-                let (_, batches) = self.execute_source_query(sql)?;
+                let mut source = self.event_select_source(sql)?;
                 let info = SourceInfo {
                     kind: "select".to_string(),
                     reference: sql.clone(),
@@ -115,10 +149,7 @@ impl Runtime {
                     watermark: None,
                     source_token: None,
                 };
-                let mut source = ReplaySource {
-                    batches: batches.into_iter(),
-                };
-                store.create_dataset(def, &info, &mut source, &config.events)?
+                store.create_dataset(def, &info, source.as_mut(), &config.events)?
             }
         };
         status_result(&format!(
@@ -346,11 +377,8 @@ impl Runtime {
         let record = store.dataset(name)?.record.clone();
         let config = self.config_snapshot();
         let report = if record.source_kind == "select" {
-            let (_, batches) = self.execute_source_query(&record.source_ref)?;
-            let mut source = ReplaySource {
-                batches: batches.into_iter(),
-            };
-            store.rebuild_dataset_with(name, &mut source, None, &config.events)?
+            let mut source = self.event_select_source(&record.source_ref)?;
+            store.rebuild_dataset_with(name, source.as_mut(), None, &config.events)?
         } else {
             let (datasource, schema, table) = split_source_ref(&record)?;
             let catalog = self.catalog_snapshot();

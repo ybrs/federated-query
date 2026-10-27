@@ -79,13 +79,21 @@ pub const MEMORY_LIMIT_BYTES: usize = 32 * 1024 * 1024 * 1024;
 /// behind every DataFusion context the engine creates.
 pub(crate) fn runtime_env() -> Arc<RuntimeEnv> {
     static ENV: OnceLock<Arc<RuntimeEnv>> = OnceLock::new();
-    ENV.get_or_init(|| {
-        RuntimeEnvBuilder::new()
-            .with_memory_pool(Arc::new(FairSpillPool::new(MEMORY_LIMIT_BYTES)))
-            .build_arc()
-            .expect("DataFusion runtime environment construction failed")
-    })
-    .clone()
+    ENV.get_or_init(build_runtime_env).clone()
+}
+
+/// Bound local object-store operations across every manifest and execution context.
+fn build_runtime_env() -> Arc<RuntimeEnv> {
+    use datafusion::execution::object_store::ObjectStoreUrl;
+    use datafusion::object_store::{limit::LimitStore, local::LocalFileSystem};
+
+    let environment = RuntimeEnvBuilder::new()
+        .with_memory_pool(Arc::new(FairSpillPool::new(MEMORY_LIMIT_BYTES)))
+        .build_arc()
+        .expect("DataFusion runtime environment construction failed");
+    let files = LimitStore::new(LocalFileSystem::new(), 32);
+    environment.register_object_store(ObjectStoreUrl::local_filesystem().as_ref(), Arc::new(files));
+    environment
 }
 
 /// The ONE tokio runtime every query in this process executes on, and the
@@ -223,7 +231,9 @@ fn coordinator_context(config: SessionConfig) -> SessionContext {
         .with_query_planner(Arc::new(crate::list_expansion::ExpansionQueryPlanner))
         .with_physical_optimizer_rules(rules)
         .build();
-    SessionContext::new_with_state(state)
+    let context = SessionContext::new_with_state(state);
+    context.register_udf(crate::json::udf());
+    context
 }
 
 /// Fully-read Arrow data with its schema. Clone is Arc-shallow (RecordBatch

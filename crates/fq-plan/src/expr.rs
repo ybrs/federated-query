@@ -964,6 +964,7 @@ fn wider_numeric(left: DataType, right: DataType) -> DataType {
 /// Anything else yields VARCHAR.
 fn function_call_type(function_name: &str, args: &[Expr]) -> DataType {
     match function_name.to_uppercase().as_str() {
+        "JSON_EXTRACT_STRING" | "JSON_EXTRACT_PATH_TEXT" => crate::json::result_type(args),
         "STRUCT_EXTRACT" => structured_field_type(args),
         "MAKE_ARRAY" | "ARRAY_AGG" => array_result_type(args),
         "COUNT" | "SUM" | "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "NTILE" => DataType::BigInt,
@@ -1226,6 +1227,22 @@ fn substitute_aggregate_refs(
         return expr;
     }
     expr.map_children(&mut |child| substitute_aggregate_refs(child, output_map))
+}
+
+/// Recognize native JSON extraction anywhere inside a scalar expression.
+pub fn contains_json_extraction(expression: &Expr) -> bool {
+    if let Expr::FunctionCall { function_name, .. } = expression {
+        if matches!(
+            function_name.to_uppercase().as_str(),
+            "JSON_EXTRACT_STRING" | "JSON_EXTRACT_PATH_TEXT"
+        ) {
+            return true;
+        }
+    }
+    expression
+        .children()
+        .iter()
+        .any(|child| contains_json_extraction(child))
 }
 
 #[cfg(test)]

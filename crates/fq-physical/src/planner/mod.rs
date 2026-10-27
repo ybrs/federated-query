@@ -126,6 +126,13 @@ impl PhysicalPlanner {
         self
     }
 
+    /// Allow a source ingestion SELECT to render as one native streaming query.
+    #[must_use]
+    pub fn with_streaming_source(mut self, enabled: bool) -> Self {
+        self.single_source = self.single_source.with_streaming_source(enabled);
+        self
+    }
+
     /// Wire the learned-stats catalog (and its freshness bound) dim shipping reads
     /// measured group counts from. Pass the SAME `Arc<StatsCatalog>` and TTL the
     /// cost model's statistics collector holds, so the shipping gate reads the slot

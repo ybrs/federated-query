@@ -51,6 +51,13 @@ impl OrderKeys {
 
     /// A scan with this order folded into its order metadata.
     fn into_scan(self, mut scan: Scan) -> LogicalPlan {
+        if self
+            .keys
+            .iter()
+            .any(fq_plan::expr::contains_json_extraction)
+        {
+            return self.into_sort(LogicalPlan::Scan(Box::new(scan)));
+        }
         scan.order_by_keys = Some(self.keys);
         scan.order_by_ascending = Some(self.ascending);
         scan.order_by_nulls = self.nulls;
@@ -70,6 +77,14 @@ fn push_order_by(plan: LogicalPlan) -> Result<LogicalPlan, OptimizeError> {
 /// still dissolves order metadata into any scan underneath. Ports
 /// `_try_push_sort`.
 fn try_push_sort(sort: Sort) -> Result<LogicalPlan, OptimizeError> {
+    if plan_uses_json(&sort.input)
+        || sort
+            .sort_keys
+            .iter()
+            .any(fq_plan::expr::contains_json_extraction)
+    {
+        return Ok(LogicalPlan::Sort(sort));
+    }
     let Sort {
         input,
         sort_keys,
@@ -94,6 +109,14 @@ fn try_push_sort(sort: Sort) -> Result<LogicalPlan, OptimizeError> {
         // reorders rows); any other input bottoms out with the Sort in place.
         other => Ok(order.into_sort(other)),
     }
+}
+
+/// Keep ordering above native JSON work instead of attaching it to external scans.
+fn plan_uses_json(plan: &LogicalPlan) -> bool {
+    plan.direct_expressions()
+        .iter()
+        .any(|expression| fq_plan::expr::contains_json_extraction(expression))
+        || plan.children().iter().any(|child| plan_uses_json(child))
 }
 
 /// Whether every sort key is a plain column reference. Ports

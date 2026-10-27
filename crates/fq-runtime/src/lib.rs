@@ -51,6 +51,14 @@ use fq_plan::physical::PhysicalPlan;
 
 pub use error::RuntimeError;
 
+/// Source ingestion renders a single-source SELECT as one streaming source read.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum QueryPurpose {
+    User,
+    StoredSelect,
+    EventSource,
+}
+
 /// One assembled engine session: a shared catalog (metadata + statistics) plus
 /// the config that governs optimization and cost. The fq-exec data plane is a
 /// process-wide registry the constructor populates under this runtime's
@@ -417,7 +425,7 @@ impl Runtime {
     /// Plan and run one user SELECT/VALUES statement through the full pipeline,
     /// with view substitution enabled.
     fn execute_query(&self, sql: &str) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
-        let (physical, substitutions) = self.plan_inner(sql, true)?;
+        let (physical, substitutions) = self.plan_inner(sql, QueryPurpose::User)?;
         let visible_names = fq_plan::physical::visible_output_names(&physical);
         self.ensure_event_analysis_ready(&physical)?;
         let execution = execute_plan(self.session, &physical)?;
@@ -443,10 +451,18 @@ impl Runtime {
         &self,
         sql: &str,
     ) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
-        let (physical, _no_substitutions) = self.plan_inner(sql, false)?;
-        let visible_names = fq_plan::physical::visible_output_names(&physical);
-        self.ensure_event_analysis_ready(&physical)?;
-        let execution = execute_plan(self.session, &physical)?;
+        let (physical, _no_substitutions) = self.plan_inner(sql, QueryPurpose::StoredSelect)?;
+        self.execute_source_plan(&physical)
+    }
+
+    /// Execute an already-bound source plan without planning it a second time.
+    fn execute_source_plan(
+        &self,
+        physical: &PhysicalPlan,
+    ) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
+        let visible_names = fq_plan::physical::visible_output_names(physical);
+        self.ensure_event_analysis_ready(physical)?;
+        let execution = execute_plan(self.session, physical)?;
         self.persist_observations(&execution.measurements, &execution.observations)?;
         rename_result(&execution.schema, execution.batches, &visible_names)
     }
@@ -607,14 +623,14 @@ impl Runtime {
     /// the same `PlanBudget`), so a plan-time data scan or a slow remote probe is
     /// KILLED and reported, never silently paid per query.
     fn plan(&self, sql: &str) -> Result<PhysicalPlan, RuntimeError> {
-        Ok(self.plan_inner(sql, true)?.0)
+        Ok(self.plan_inner(sql, QueryPurpose::User)?.0)
     }
 
     /// The plan plus the substitutions it applied. `plan` discards the latter
     /// (EXPLAIN / describe do not serve, so they record no benefit); only
     /// `execute_query` keeps it, to advance the benefit counters after serving.
     ///
-    /// `allow_substitution` is false for the materialized-view DDL data pulls
+    /// `StoredSelect` is used for the materialized-view DDL data pulls
     /// (`execute_source_query`): a REFRESH re-executes the view's definition to
     /// pull FROM THE SOURCE, so substituting the view for its own definition
     /// would read the stale cache and make refresh a no-op. Only user queries
@@ -622,7 +638,7 @@ impl Runtime {
     fn plan_inner(
         &self,
         sql: &str,
-        allow_substitution: bool,
+        purpose: QueryPurpose,
     ) -> Result<(PhysicalPlan, Vec<substitute::AppliedSubstitution>), RuntimeError> {
         // One catalog snapshot for the whole plan, so a concurrent DDL swap
         // cannot change the metadata mid-pipeline.
@@ -645,7 +661,7 @@ impl Runtime {
         // physical planning, so the planner and step builder see the reduced
         // tree (a substituted scan is a local leaf, so dim shipping leaves it
         // alone). This step is O(views x metadata) and budget-tracked.
-        let (substituted, applied) = if allow_substitution {
+        let (substituted, applied) = if purpose == QueryPurpose::User {
             self.substitute_views(optimized, &catalog, &config, &cost_model)?
         } else {
             (optimized, Vec::new())
@@ -657,7 +673,11 @@ impl Runtime {
         let ship_thresholds = ShipThresholds::from_config(&config.optimizer);
         let mut planner = PhysicalPlanner::new(Arc::clone(&catalog), Some(Rc::clone(&cost_model)))
             .with_ship_thresholds(ship_thresholds)
-            .with_single_source_pushdown(config.optimizer.enable_single_source_pushdown);
+            .with_single_source_pushdown(
+                config.optimizer.enable_single_source_pushdown
+                    || purpose == QueryPurpose::EventSource,
+            )
+            .with_streaming_source(purpose == QueryPurpose::EventSource);
         let physical = planner.plan(&substituted)?;
         // Referential closure, before anything executes: a node referencing a
         // qualified column no child produces would otherwise surface as an Arrow
@@ -1482,3 +1502,5 @@ fn renamed_schema(schema: &SchemaRef, names: &[String]) -> SchemaRef {
     }
     Arc::new(Schema::new(fields))
 }
+
+mod source_stream;

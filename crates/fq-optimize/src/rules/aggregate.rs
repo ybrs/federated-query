@@ -35,6 +35,9 @@ fn push_aggregate(plan: LogicalPlan) -> Result<LogicalPlan, OptimizeError> {
 /// still hold a foldable aggregate (a HAVING subquery under the main aggregate),
 /// so recurse. Ports `_try_push_aggregate`.
 fn try_push_aggregate(aggregate: Aggregate) -> Result<LogicalPlan, OptimizeError> {
+    if aggregate_uses_json(&aggregate) {
+        return LogicalPlan::Aggregate(aggregate).try_map_children(push_aggregate);
+    }
     let Aggregate {
         input,
         group_by,
@@ -132,6 +135,22 @@ fn recurse_node(plan: LogicalPlan) -> Result<LogicalPlan, OptimizeError> {
         | LogicalPlan::SubqueryScan(_)
         | LogicalPlan::Cte(_)) => recurse.try_map_children(push_aggregate),
         other => Ok(other),
+    }
+}
+
+/// Retain native-only scalar work above scans so external sources cannot change its meaning.
+fn aggregate_uses_json(aggregate: &Aggregate) -> bool {
+    if aggregate
+        .group_by
+        .iter()
+        .chain(&aggregate.aggregates)
+        .any(fq_plan::expr::contains_json_extraction)
+    {
+        return true;
+    }
+    match aggregate.input.as_ref() {
+        LogicalPlan::Filter(filter) => fq_plan::expr::contains_json_extraction(&filter.predicate),
+        _ => false,
     }
 }
 

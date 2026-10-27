@@ -1182,3 +1182,32 @@ fn visit_expr_tree(expr: &Expr, visit: &mut impl FnMut(&Expr)) {
         visit_expr_tree(child, visit);
     }
 }
+
+/// Repeated grouped expressions read the selected output instead of vanished raw inputs.
+#[test]
+fn order_by_grouped_expression_reads_its_selected_output() {
+    let plan = bind_sql("SELECT user_id+1 AS grouped, count(*) AS n FROM pg.public.orders GROUP BY user_id+1 ORDER BY user_id+1").unwrap();
+    assert_all_qualified(&plan);
+    let Expr::Column(key) = &find_sort(&plan).sort_keys[0] else {
+        panic!("sort must read an output");
+    };
+    assert_eq!(key.column, "grouped");
+}
+
+/// Unselected grouping expressions get hidden outputs that do not widen the result.
+#[test]
+fn order_by_unselected_grouped_expression_adds_a_hidden_output() {
+    let plan = bind_sql(
+        "SELECT count(*) AS n FROM pg.public.orders GROUP BY user_id+1 ORDER BY user_id+1",
+    )
+    .unwrap();
+    assert_all_qualified(&plan);
+    let LogicalPlan::Projection(restore) = &plan else {
+        panic!("hidden output must be removed");
+    };
+    assert_eq!(restore.aliases, vec!["n"]);
+    let Expr::Column(key) = &find_sort(&plan).sort_keys[0] else {
+        panic!("sort must read an output");
+    };
+    assert_eq!(key.column, "__agg_1");
+}

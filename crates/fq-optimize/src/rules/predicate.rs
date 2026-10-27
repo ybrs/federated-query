@@ -74,6 +74,9 @@ fn push_down(plan: LogicalPlan) -> Result<LogicalPlan, OptimizeError> {
 /// here plus re-merging stacked filters would oscillate forever). Ports
 /// `_push_filter`.
 fn push_filter(filter: Filter) -> Result<LogicalPlan, OptimizeError> {
+    if fq_plan::expr::contains_json_extraction(&filter.predicate) {
+        return LogicalPlan::Filter(filter).try_map_children(push_down);
+    }
     let Filter { input, predicate } = filter;
     let predicate = factor_filter_predicate(predicate);
     let predicate = derive_disjunction_predicates(predicate);

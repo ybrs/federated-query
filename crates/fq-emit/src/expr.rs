@@ -204,11 +204,7 @@ fn render_function(
     // A zero-argument SCALAR call (`now()`) keeps its empty parens. An ordered-set
     // aggregate (`MODE() WITHIN GROUP (...)`) is parameterless by definition and
     // takes empty parens, never the star form.
-    let name = if name.eq_ignore_ascii_case("STRUCT_EXTRACT") {
-        "get_field"
-    } else {
-        name
-    };
+    let name = canonical_function_name(name);
     let rendered = if is_aggregate && args.is_empty() && within_group_key.is_none() {
         "*".to_string()
     } else {
@@ -376,6 +372,15 @@ fn render_all(exprs: &[Expr], resolver: &dyn ColumnResolver) -> Result<Vec<Strin
         out.push(render_expr(expr, resolver)?);
     }
     Ok(out)
+}
+
+/// Normalize native aliases before SQL transpilation can reinterpret their path syntax.
+fn canonical_function_name(name: &str) -> &str {
+    match name.to_uppercase().as_str() {
+        "STRUCT_EXTRACT" => "get_field",
+        "JSON_EXTRACT_STRING" | "JSON_EXTRACT_PATH_TEXT" => "json_extract_string",
+        _ => name,
+    }
 }
 
 #[cfg(test)]

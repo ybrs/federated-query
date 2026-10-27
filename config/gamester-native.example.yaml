@@ -1,0 +1,11 @@
+datasources:
+  gamester_raw:
+    type: parquet
+    manifest: /path/to/gamester-files.txt
+executor:
+  max_threads: 2
+  max_memory_mb: 512
+events:
+  build_threads: 2
+  build_memory_bytes: 6442450944
+  cache_bytes: 268435456

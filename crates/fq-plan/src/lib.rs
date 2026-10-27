@@ -30,3 +30,5 @@ pub use physical::{
     output_column_names, physical_column_name, BuildSide, ColumnAliasMap, DatasourceKind,
     GroupObservation, PhysicalPlan, PhysicalRemoteQuery, PhysicalTableFunction, SeededSchema,
 };
+
+mod json;

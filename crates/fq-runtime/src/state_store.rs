@@ -22,12 +22,13 @@
 //! inode and would serve state no longer at that path.
 
 use std::collections::BTreeSet;
-use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::ptr::NonNull;
+use std::sync::{Mutex, OnceLock};
 
 use fq_common::Config;
+use rusqlite::{ffi, Connection, OpenFlags};
 
 use crate::error::RuntimeError;
 
@@ -49,6 +50,7 @@ struct FileIdentity {
 struct StoreFile {
     path: PathBuf,
     identity: FileIdentity,
+    header_reader: Mutex<Connection>,
 }
 
 /// The runtime's hold on its state files, plus the fatal message once one of
@@ -71,6 +73,7 @@ impl StateStore {
         for path in state_store_paths(config) {
             files.push(StoreFile {
                 identity: identify(&path)?,
+                header_reader: open_header_reader(&path)?,
                 path,
             });
         }
@@ -90,7 +93,7 @@ impl StateStore {
             return Err(RuntimeError::StateStoreLost(message.clone()));
         }
         for file in &self.files {
-            if let Err(detail) = inspect(&file.path, &file.identity) {
+            if let Err(detail) = inspect(file) {
                 return Err(self.poison(&file.path, &detail));
             }
         }
@@ -135,28 +138,77 @@ fn read_identity(path: &Path) -> std::io::Result<FileIdentity> {
 /// Whether the file at `path` is still the SQLite database that was opened: it
 /// must be readable, be the same file, and still carry the SQLite header. The
 /// error describes what happened to it, for the fatal message.
-fn inspect(path: &Path, opened_as: &FileIdentity) -> Result<(), String> {
-    let identity = read_identity(path).map_err(|error| format!("cannot be read: {error}"))?;
-    if identity != *opened_as {
+fn inspect(file: &StoreFile) -> Result<(), String> {
+    let identity = read_identity(&file.path).map_err(|error| format!("cannot be read: {error}"))?;
+    if identity != file.identity {
         return Err("was replaced by a different file".to_string());
     }
-    if !starts_with_sqlite_header(path)? {
+    let reader = file
+        .header_reader
+        .lock()
+        .expect("state header reader lock poisoned");
+    if !starts_with_sqlite_header(&reader)? {
         return Err("is no longer a SQLite database (truncated or overwritten)".to_string());
     }
     Ok(())
 }
 
-/// Whether the file still begins with the SQLite header. A file too short to
-/// hold the header has been truncated, which reads as no header.
-fn starts_with_sqlite_header(path: &Path) -> Result<bool, String> {
-    let mut file =
-        std::fs::File::open(path).map_err(|error| format!("cannot be opened: {error}"))?;
+/// Keep the header descriptor under SQLite's inode-lock bookkeeping. Closing an
+/// ordinary file descriptor would release the process's SQLite POSIX locks too.
+fn open_header_reader(path: &Path) -> Result<Mutex<Connection>, RuntimeError> {
+    let reader = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| RuntimeError::StateStoreLost(fatal_message(path, &error.to_string())))?;
+    Ok(Mutex::new(reader))
+}
+
+/// Read the actual file header through SQLite's VFS, bypassing its page cache.
+/// A file too short to hold the header has been truncated, which reads as false.
+fn starts_with_sqlite_header(reader: &Connection) -> Result<bool, String> {
     let mut header = [0u8; SQLITE_HEADER.len()];
-    match file.read_exact(&mut header) {
-        Ok(()) => Ok(&header == SQLITE_HEADER),
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
-        Err(error) => Err(format!("cannot be read: {error}")),
+    match read_header(reader, &mut header)? {
+        ffi::SQLITE_OK => Ok(&header == SQLITE_HEADER),
+        ffi::SQLITE_IOERR_SHORT_READ => Ok(false),
+        code => Err(sqlite_read_error(code)),
     }
+}
+
+/// Borrow the open main-database VFS file while its owning connection stays live.
+fn sqlite_file(reader: &Connection) -> Result<NonNull<ffi::sqlite3_file>, String> {
+    let mut file: *mut ffi::sqlite3_file = std::ptr::null_mut();
+    // SAFETY: the connection is live and the output points to a writable file slot.
+    let code = unsafe {
+        ffi::sqlite3_file_control(
+            reader.handle(),
+            c"main".as_ptr(),
+            ffi::SQLITE_FCNTL_FILE_POINTER,
+            (&raw mut file).cast(),
+        )
+    };
+    if code != ffi::SQLITE_OK {
+        return Err(sqlite_read_error(code));
+    }
+    NonNull::new(file).ok_or_else(|| "SQLite state-file handle is null".to_string())
+}
+
+/// Read only the header bytes with the connection-owned file's VFS callback.
+fn read_header(reader: &Connection, header: &mut [u8; 16]) -> Result<i32, String> {
+    let file = sqlite_file(reader)?;
+    // SAFETY: SQLite owns this file and its method table for the live connection.
+    let methods = unsafe { file.as_ref().pMethods.as_ref() }
+        .ok_or_else(|| "SQLite state-file methods are null".to_string())?;
+    let read = methods
+        .xRead
+        .ok_or_else(|| "SQLite state-file reader is absent".to_string())?;
+    // SAFETY: the connection is locked and the callback receives a writable 16-byte buffer.
+    Ok(unsafe { read(file.as_ptr(), header.as_mut_ptr().cast(), 16, 0) })
+}
+
+/// Preserve SQLite's native result code in a failed header read.
+fn sqlite_read_error(code: i32) -> String {
+    format!(
+        "cannot read SQLite file header: {}",
+        rusqlite::Error::SqliteFailure(ffi::Error::new(code), None)
+    )
 }
 
 /// The fatal message: what happened, to which file, and that the runtime is
@@ -170,4 +222,97 @@ fn fatal_message(path: &Path, detail: &str) -> String {
          failure: restart the engine over an intact store.",
         path.display()
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use fq_common::Config;
+    use rusqlite::Connection;
+
+    use super::StateStore;
+
+    const PEER_QUERY: &str = concat!(
+        "import sqlite3,sys; db=sqlite3.connect(sys.argv[1]); ",
+        "print(db.execute('SELECT count(*) FROM guard_rows').fetchone()[0]); ",
+        "db.close()"
+    );
+    const WAL_SETUP: &str = concat!(
+        "PRAGMA journal_mode=WAL; CREATE TABLE guard_rows(value); ",
+        "INSERT INTO guard_rows VALUES(1);"
+    );
+
+    /// Create an isolated WAL writer and the runtime's state-file guard.
+    fn guarded_writer() -> (PathBuf, PathBuf, Connection, StateStore) {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("the clock follows the Unix epoch")
+            .as_nanos();
+        let directory = std::env::temp_dir().join(format!("fq_header_locks_{nonce}"));
+        std::fs::create_dir(&directory).expect("create state-file sandbox");
+        let path = directory.join("config.stats.sqlite");
+        let writer = Connection::open(&path).expect("open WAL writer");
+        writer
+            .execute_batch(WAL_SETUP)
+            .expect("initialize committed WAL state");
+        let config = guard_config(&directory);
+        let guard = StateStore::record(&config).expect("record state-file identity");
+        (directory, path, writer, guard)
+    }
+
+    /// Load a minimal real config that names this sandbox's state store.
+    fn guard_config(directory: &Path) -> Config {
+        let path = directory.join("config.yaml");
+        std::fs::write(&path, "datasources: {}\n").expect("write guard config");
+        fq_common::load_config(path.to_str().expect("config path is UTF-8"))
+            .expect("load guard config")
+    }
+
+    /// Read and close SQLite in another process, exercising its last-close checkpoint.
+    fn peer_count(path: &Path) -> i64 {
+        let output = peer_reader(path);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .expect("reader output is UTF-8")
+            .trim()
+            .parse()
+            .expect("reader returns a row count")
+    }
+
+    /// Execute the independent reader with the active Python virtualenv.
+    fn peer_reader(path: &Path) -> std::process::Output {
+        let environment = std::env::var_os("VIRTUAL_ENV").expect("activate the Python virtualenv");
+        let python = PathBuf::from(environment).join("bin/python3");
+        Command::new(python)
+            .args(["-c", PEER_QUERY])
+            .arg(path)
+            .output()
+            .expect("run independent SQLite reader")
+    }
+
+    /// Keep a peer from deleting the WAL that the live writer still needs.
+    #[test]
+    fn header_checks_preserve_committed_wal_state_for_other_processes() {
+        let (directory, path, writer, guard) = guarded_writer();
+        guard.check().expect("the intact header is accepted");
+        assert_eq!(peer_count(&path), 1);
+        writer
+            .execute("INSERT INTO guard_rows VALUES(2)", [])
+            .expect("commit another row");
+        assert_eq!(
+            peer_count(&path),
+            2,
+            "a peer must see the committed WAL write"
+        );
+        drop(guard);
+        drop(writer);
+        std::fs::remove_dir_all(directory).expect("remove state-file sandbox");
+    }
 }

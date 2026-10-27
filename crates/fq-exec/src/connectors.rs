@@ -597,6 +597,7 @@ fn parquet_tables_ctx(
         config,
         crate::engine::runtime_env(),
     );
+    ctx.register_udf(crate::json::udf());
     parquet_runtime().block_on(register_parquet_tables_async(&ctx, tables))?;
     Ok(ctx)
 }
@@ -718,6 +719,7 @@ fn materialized_ctx(
         config,
         crate::engine::runtime_env(),
     );
+    ctx.register_udf(crate::json::udf());
     parquet_runtime().block_on(register_materialized_tables(&ctx, tables))?;
     Ok(ctx)
 }

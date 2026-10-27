@@ -619,6 +619,7 @@ impl Binder<'_> {
         };
         let mut bound_args = self.bind_expr_list(args)?;
         crate::nested::validate_nested_call(function_name, &mut bound_args)?;
+        crate::json::validate(function_name, &bound_args)?;
         let bound_within_group = self.bind_opt(within_group_key.as_deref())?;
         let bound_filter = self.bind_opt(filter.as_deref())?;
         // Fresh bound copy from the borrowed source (no `..base` on an enum variant):

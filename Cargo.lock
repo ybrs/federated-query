@@ -1949,6 +1949,7 @@ dependencies = [
 name = "fq-bind"
 version = "0.1.0"
 dependencies = [
+ "arrow-schema",
  "fq-catalog",
  "fq-common",
  "fq-parse",
@@ -2063,12 +2064,14 @@ dependencies = [
  "fq-physical",
  "fq-plan",
  "futures",
+ "libc",
  "mysql",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "ureq",
+ "yyjson-sys",
 ]
 
 [[package]]
@@ -2154,6 +2157,7 @@ dependencies = [
  "fq-plan",
  "fq-scram",
  "parquet",
+ "rusqlite",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -5486,6 +5490,15 @@ dependencies = [
  "quote",
  "syn 2.0.118",
  "synstructure",
+]
+
+[[package]]
+name = "yyjson-sys"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ed7a5810c650d227cae9d2cb1c73cf0d6d5901181cb2a53dc07007dfcead82c"
+dependencies = [
+ "cc",
 ]
 
 [[package]]

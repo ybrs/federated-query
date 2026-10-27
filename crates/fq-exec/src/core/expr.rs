@@ -180,6 +180,7 @@ fn scalar_registry() -> &'static HashMap<String, Arc<ScalarUDF>> {
         let mut map = HashMap::new();
         let mut functions = all_default_functions();
         functions.extend(datafusion::functions_nested::all_default_nested_functions());
+        functions.push(Arc::new(crate::json::udf()));
         for udf in functions {
             map.insert(udf.name().to_string(), udf.clone());
             for alias in udf.aliases() {

@@ -254,3 +254,48 @@ fn joins_duckdb_nation_against_postgres_region() {
         .execute("DROP TABLE IF EXISTS fq_rt_region;")
         .expect("drop PostgreSQL fixture");
 }
+
+/// Keep JSON projections and predicates on the coordinator when PostgreSQL lacks the function.
+#[test]
+fn postgres_json_extraction_matches_native_semantics() {
+    let duck = seed_duck_fixture();
+    let driver = adbc_driver_path();
+    let setup =
+        PostgresSource::connect("json_setup", &pg_conn_str(), vec!["public".into()]).unwrap();
+    setup.execute("DROP TABLE IF EXISTS fq_rt_json_region; CREATE TABLE fq_rt_json_region(r_regionkey integer,r_name text); INSERT INTO fq_rt_json_region VALUES(0,'AFRICA'),(1,'EUROPE'); ANALYZE fq_rt_json_region;").unwrap();
+    let runtime = Runtime::from_config(&cross_config(duck.to_str().unwrap(), &driver)).unwrap();
+    assert_postgres_json_queries(&runtime);
+    drop(runtime);
+    setup.execute("DROP TABLE fq_rt_json_region").unwrap();
+}
+
+/// Compare projection, WHERE, GROUP BY and ORDER BY without asking PostgreSQL to run JSON SQL.
+fn assert_postgres_json_queries(runtime: &Runtime) {
+    let extract = "json_extract_string('\"' || r.r_name || '\"', '$')";
+    let table = "pg.public.fq_rt_json_region AS r";
+    let queries = [
+        (format!("SELECT {extract} AS name FROM {table} WHERE r.r_regionkey=0"), "AFRICA"),
+        (format!("SELECT r.r_name FROM {table} WHERE {extract}='AFRICA'"), "AFRICA"),
+        (format!("SELECT {extract} AS name FROM {table} GROUP BY {extract} ORDER BY {extract} LIMIT 1"), "AFRICA"),
+        (format!("SELECT r.r_name FROM {table} ORDER BY {extract} DESC LIMIT 1"), "EUROPE"),
+        (format!("SELECT {extract} AS name, ROW_NUMBER() OVER (ORDER BY r.r_name) AS seq FROM {table} LIMIT 1"), "AFRICA"),
+        (format!("SELECT json_extract_path_text('\"' || r.r_name || '\"', '$') AS name FROM {table} WHERE r.r_regionkey=0"), "AFRICA"),
+    ];
+    for (sql, expected) in queries {
+        assert_postgres_json_query(runtime, &sql, expected);
+    }
+}
+
+/// Require the decoded result and row count to survive coordinator placement.
+fn assert_postgres_json_query(runtime: &Runtime, sql: &str, expected: &str) {
+    let (_, batches) = runtime
+        .execute(sql)
+        .unwrap_or_else(|error| panic!("{sql}: {error}"));
+    let values = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(values.value(0), expected, "{sql}");
+    assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+}

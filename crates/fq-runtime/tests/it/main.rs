@@ -17,3 +17,5 @@ mod state_store;
 mod substitution;
 mod unnest;
 mod views;
+
+mod native_ingestion;

@@ -270,7 +270,7 @@ impl<'a> Binder<'a> {
                 binder.bind_sort_keys(&sort.sort_keys, &output_names)
             })
         })?;
-        if sort_keys.iter().any(needs_aggregate_hoist) && over_aggregate(&input) {
+        if over_aggregate(&input) {
             sort.input = Box::new(input);
             return Ok(hoist_sort_over_aggregate(sort, sort_keys));
         }
@@ -1024,26 +1024,6 @@ fn reject_ungrouped_having_columns(
     Ok(())
 }
 
-/// Whether a bound ORDER BY key contains an aggregate-scoped call (an aggregate
-/// function or `GROUPING()`). Such a key cannot be recomputed above the
-/// aggregate - the raw inputs are gone - so it must be hoisted onto aggregate
-/// OUTPUTS, exactly like a HAVING predicate.
-fn needs_aggregate_hoist(expr: &Expr) -> bool {
-    if let Expr::FunctionCall {
-        is_aggregate,
-        function_name,
-        ..
-    } = expr
-    {
-        if *is_aggregate || function_name.eq_ignore_ascii_case("grouping") {
-            return true;
-        }
-    }
-    expr.children()
-        .iter()
-        .any(|child| needs_aggregate_hoist(child))
-}
-
 /// Whether a bound Sort input is an Aggregate, directly or under its HAVING
 /// filter - the shapes whose ORDER BY keys hoist onto aggregate outputs.
 fn over_aggregate(plan: &LogicalPlan) -> bool {
@@ -1056,9 +1036,9 @@ fn over_aggregate(plan: &LogicalPlan) -> bool {
     }
 }
 
-/// Bind ORDER BY over an Aggregate (optionally under its HAVING filter) when a
-/// key carries an aggregate call: each call becomes a reference to a (hidden)
-/// aggregate output the sort reads by name - `ORDER BY count(*)` where the
+/// Bind ORDER BY over an Aggregate, optionally under its HAVING filter. Grouped
+/// expressions and aggregate calls become references to real aggregate outputs.
+/// `ORDER BY count(*)` where the
 /// SELECT already computes it references THAT output instead of recomputing
 /// over grouped rows (where the raw inputs no longer exist). A call absent
 /// from the SELECT list is appended as a hidden `__agg_N` output and a
@@ -1076,13 +1056,22 @@ fn hoist_sort_over_aggregate(mut sort: Sort, bound_keys: Vec<Expr>) -> LogicalPl
         },
         other => unreachable!("over_aggregate admitted a non-aggregate sort input: {other:?}"),
     };
+    let expose_group = bound_keys
+        .iter()
+        .any(|key| contains_group_key(key, &aggregate.group_by));
     let original_names = aggregate.output_names.clone();
     let original_aggregates = aggregate.aggregates.clone();
     let mut aggregates = aggregate.aggregates.clone();
     let mut names = aggregate.output_names.clone();
     let mut rewritten = Vec::with_capacity(bound_keys.len());
     for key in bound_keys {
-        rewritten.push(hoist_aggregate_calls(key, &mut aggregates, &mut names));
+        let key = hoist_aggregate_calls(key, &mut aggregates, &mut names);
+        rewritten.push(hoist_group_keys(
+            key,
+            &aggregate.group_by,
+            &mut aggregates,
+            &mut names,
+        ));
     }
     let widened_count = names.len() - original_names.len();
     // Widen the aggregate with any hidden outputs the keys now name, in place.
@@ -1100,6 +1089,9 @@ fn hoist_sort_over_aggregate(mut sort: Sort, bound_keys: Vec<Expr>) -> LogicalPl
     // and `nulls_order` are preserved untouched.
     sort.input = Box::new(sorted_input);
     sort.sort_keys = rewritten;
+    if expose_group {
+        sort = expose_group_order(sort);
+    }
     let sorted = LogicalPlan::Sort(sort);
     if widened_count == 0 {
         return sorted;
@@ -1107,7 +1099,7 @@ fn hoist_sort_over_aggregate(mut sort: Sort, bound_keys: Vec<Expr>) -> LogicalPl
     let mut restore = Vec::with_capacity(original_names.len());
     for (name, agg) in original_names.iter().zip(&original_aggregates) {
         restore.push(Expr::Column(ColumnRef::new(
-            None,
+            expose_group.then(|| "__fq_group_order".to_string()),
             name.clone(),
             Some(agg.get_type()),
         )));
@@ -1121,6 +1113,56 @@ fn hoist_sort_over_aggregate(mut sort: Sort, bound_keys: Vec<Expr>) -> LogicalPl
         distinct: false,
         distinct_on: None,
     })
+}
+
+/// Detect grouped subexpressions whose outputs need an explicit owning relation.
+fn contains_group_key(expr: &Expr, groups: &[Expr]) -> bool {
+    groups.contains(expr)
+        || expr
+            .children()
+            .iter()
+            .any(|child| contains_group_key(child, groups))
+}
+
+/// Expose aggregate outputs under a real relation before qualified sorting and restoration.
+fn expose_group_order(mut sort: Sort) -> Sort {
+    // Fresh SubqueryScan gives aggregate outputs an owning relation for the sort.
+    // The complete field list is input, alias and optional positional column names.
+    sort.input = Box::new(LogicalPlan::SubqueryScan(SubqueryScan {
+        input: sort.input,
+        alias: "__fq_group_order".into(),
+        column_names: None,
+    }));
+    sort.sort_keys = sort
+        .sort_keys
+        .into_iter()
+        .map(qualify_group_output)
+        .collect();
+    sort
+}
+
+/// Every synthetic aggregate output reference belongs to the exposed aggregate relation.
+fn qualify_group_output(expr: Expr) -> Expr {
+    if let Expr::Column(mut column) = expr {
+        if column.table.is_none() {
+            column.table = Some("__fq_group_order".into());
+        }
+        return Expr::Column(column);
+    }
+    expr.map_children(&mut qualify_group_output)
+}
+
+/// Replace grouped expressions with real aggregate outputs before their raw inputs disappear.
+fn hoist_group_keys(
+    expr: Expr,
+    groups: &[Expr],
+    aggregates: &mut Vec<Expr>,
+    names: &mut Vec<String>,
+) -> Expr {
+    if groups.contains(&expr) {
+        return aggregate_call_ref(expr, aggregates, names);
+    }
+    expr.map_children(&mut |child| hoist_group_keys(child, groups, aggregates, names))
 }
 
 /// Replace each aggregate-scoped call (an aggregate function or `GROUPING()`) in

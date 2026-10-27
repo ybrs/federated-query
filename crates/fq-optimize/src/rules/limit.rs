@@ -106,6 +106,14 @@ fn push_limit_with_sort(
     offset: u64,
 ) -> Result<LogicalPlan, OptimizeError> {
     let sorted_input = rewrite_plan(*sort.input)?;
+    if sort
+        .sort_keys
+        .iter()
+        .any(fq_plan::expr::contains_json_extraction)
+    {
+        sort.input = Box::new(sorted_input);
+        return Ok(wrap_limit(LogicalPlan::Sort(sort), limit_value, offset));
+    }
     match sorted_input {
         LogicalPlan::Scan(mut scan) => {
             scan.order_by_keys = Some(sort.sort_keys);

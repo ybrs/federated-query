@@ -38,6 +38,9 @@ futures = "0.3"
 # the JSON boundary moves to fedq-py.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Native JSON parsing preserves object order, duplicate keys and raw big numbers.
+yyjson-sys = "0.1"
+libc = "0.2"
 # ADBC reads Postgres straight into Arrow (the same C driver the Python path used).
 adbc_core = "0.23"
 adbc_driver_manager = "0.23"

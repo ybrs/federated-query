@@ -111,6 +111,7 @@ struct PushContext<'a> {
     // ---- pushability / shape flags ----
     has_join: bool,
     has_computed: bool,
+    has_json_extraction: bool,
     has_aggregate: bool,
     has_subquery_relation: bool,
     /// Some relation in this context contributes columns that base-scan expansion
@@ -161,6 +162,7 @@ impl<'a> PushContext<'a> {
             distinct_on: None,
             has_join: false,
             has_computed: false,
+            has_json_extraction: false,
             has_aggregate: false,
             has_subquery_relation: false,
             has_derived_columns: false,
@@ -187,6 +189,7 @@ impl<'a> PushContext<'a> {
     /// Adopt a sub-render's requirements: its text is embedded verbatim in this
     /// query, so the one source that runs the query must satisfy both.
     fn adopt_requirements(&mut self, inner: &PushContext) {
+        self.has_json_extraction |= inner.has_json_extraction;
         for capability in &inner.required {
             self.require(*capability);
         }
@@ -230,12 +233,23 @@ enum NullableRight {
 /// datasource capabilities.
 pub struct SingleSourcePushdown {
     catalog: Arc<Catalog>,
+    streaming_source: bool,
 }
 
 impl SingleSourcePushdown {
     /// Build a pushdown pass over a shared catalog.
     pub fn new(catalog: Arc<Catalog>) -> Self {
-        Self { catalog }
+        Self {
+            catalog,
+            streaming_source: false,
+        }
+    }
+
+    /// Render plain source projections too when the caller consumes a source stream.
+    #[must_use]
+    pub fn with_streaming_source(mut self, enabled: bool) -> Self {
+        self.streaming_source = enabled;
+        self
     }
 
     /// Try to collapse a subtree living on one source into a single remote query.
@@ -252,7 +266,7 @@ impl SingleSourcePushdown {
         if !self.absorb(node, &mut ctx)? {
             return Ok(None);
         }
-        if !should_push(&ctx) {
+        if !self.streaming_source && !should_push(&ctx) {
             return Ok(None);
         }
         if ctx.select_exprs.is_empty() && !self.expand_star_select(&mut ctx) {
@@ -298,6 +312,10 @@ impl SingleSourcePushdown {
         {
             return Ok(false);
         }
+        ctx.has_json_extraction |= node
+            .direct_expressions()
+            .iter()
+            .any(|expression| fq_plan::expr::contains_json_extraction(expression));
         match node {
             LogicalPlan::Limit(n) => self.absorb_limit(n, ctx),
             LogicalPlan::Sort(n) => self.absorb_sort(n, ctx),
@@ -528,6 +546,7 @@ impl SingleSourcePushdown {
         join: &'a Join,
         ctx: &mut PushContext<'a>,
     ) -> Result<bool, EmitError> {
+        ctx.require(DataSourceCapability::Joins);
         if !join_kind_supported(join.join_type) || !join_is_pushable(join) {
             return Ok(false);
         }
@@ -572,6 +591,7 @@ impl SingleSourcePushdown {
         let Some(right_ref) = self.render_relation(&node.right, ctx, false)? else {
             return Ok(false);
         };
+        ctx.require(DataSourceCapability::Joins);
         let prefix = join_prefix(node.join_type);
         ctx.joins
             .push(format!("{prefix} JOIN LATERAL {right_ref} ON TRUE"));
@@ -839,6 +859,16 @@ impl SingleSourcePushdown {
         let Some(source) = self.catalog.get_datasource(&datasource) else {
             return Ok(None);
         };
+        if ctx.has_json_extraction
+            && !matches!(
+                source.render_dialect(),
+                fq_catalog::RenderDialect::DuckDb
+                    | fq_catalog::RenderDialect::Parquet
+                    | fq_catalog::RenderDialect::Materialized
+            )
+        {
+            return Ok(None);
+        }
         if !source_accepts(source.as_ref(), &ctx.required) {
             return Ok(None);
         }
@@ -888,15 +918,8 @@ impl SingleSourcePushdown {
     }
 }
 
-/// Whether `source` accepts this island. It must declare JOINS - the island is
-/// one server-side query and the pass has always demanded that of a push target -
-/// plus every capability the absorbed clauses collected. A capability the source
-/// does not name declines the island, so the subtree lowers in the coordinator
-/// rather than being handed a construct the source never claimed to run.
+/// Require exactly the capabilities used by this island, including any nested joins.
 fn source_accepts(source: &dyn DataSource, required: &[DataSourceCapability]) -> bool {
-    if !declares(Some(source), DataSourceCapability::Joins) {
-        return false;
-    }
     for capability in required {
         if !declares(Some(source), *capability) {
             return false;

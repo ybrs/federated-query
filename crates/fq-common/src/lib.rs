@@ -56,3 +56,6 @@ pub use error::{ConfigError, UnsupportedSqlError};
 pub use events::EventsConfig;
 pub use logging::setup_logging;
 pub use types::DataType;
+
+/// JSON lookup paths shared by binding and native expression evaluation.
+pub mod json_path;
