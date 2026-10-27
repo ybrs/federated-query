@@ -209,9 +209,7 @@ impl Runtime {
             def.time_column.clone(),
             def.event_column.clone(),
         ];
-        if let Some(tiebreak) = &def.tiebreak_column {
-            roles.push(tiebreak.clone());
-        }
+        roles.extend(def.tiebreak.columns());
         for role in &roles {
             if !exists(role) {
                 return Err(RuntimeError::EventStatement(format!(
@@ -451,12 +449,7 @@ impl Runtime {
             );
             max_paths_depths
                 .push(i32::try_from(record.max_paths_depth).expect("depth bound fits i32"));
-            tiebreaks.push(
-                record
-                    .tiebreak_column
-                    .clone()
-                    .unwrap_or_else(|| "synthetic".to_string()),
-            );
+            tiebreaks.push(record.tiebreak.describe());
             promoted.push(
                 record
                     .properties
@@ -589,9 +582,7 @@ fn ingest_columns(record: &DatasetRecord) -> Vec<String> {
         record.time_column.clone(),
         record.event_column.clone(),
     ];
-    if let Some(tiebreak) = &record.tiebreak_column {
-        columns.push(tiebreak.clone());
-    }
+    columns.extend(record.tiebreak.columns());
     for def in &record.properties {
         columns.push(def.name.clone());
     }

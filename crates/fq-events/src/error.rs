@@ -44,6 +44,8 @@ pub enum EventBuildError {
     NullTime { row: u64 },
     #[error("row {row} has a NULL event name")]
     NullEventName { row: u64 },
+    #[error("row {row} has a NULL value in tiebreak column '{column}'; it cannot order the row")]
+    NullTiebreak { column: String, row: u64 },
     #[error(
         "actor {actor_key} has two events at ts {ts} with equal tiebreak; ordering \
          between them is undefined - declare a discriminating TIEBREAK column"
@@ -172,7 +174,10 @@ pub enum EventTypeError {
          microseconds or milliseconds"
     )]
     NanosecondTime { column: String },
-    #[error("TIEBREAK column '{column}' has type {found}; a tiebreak must be an integer column")]
+    #[error(
+        "TIEBREAK column '{column}' has type {found}; a single-column tiebreak must be \
+         an integer column, and an ordering column must be integer, string, or binary"
+    )]
     TiebreakType { column: String, found: String },
     #[error("property '{column}' has type {found}, which the event store does not hold")]
     PropertyType { column: String, found: String },

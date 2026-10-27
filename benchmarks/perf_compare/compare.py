@@ -258,6 +258,81 @@ def _report_summary(by_engine, queries, lines):
     lines.append("new-engine statuses: {0}".format(json.dumps(counts, sort_keys=True)))
 
 
+def _event_worker_cmd(mode, args):
+    """The worker command for one event-build measurement process."""
+    return [
+        sys.executable,
+        os.path.join(HERE, "worker.py"),
+        "--engine", "new",
+        "--source", "event",
+        "--mode", mode,
+        "--queries", args.event_name,
+        "--warmups", str(args.warmups),
+        "--runs", str(args.runs),
+        "--event-config", args.event_config,
+        "--event-sql", args.event_sql,
+        "--event-name", args.event_name,
+    ]
+
+
+def _run_event_build(args):
+    """Measure CREATE EVENT DATASET statement wall clock, cold and warm.
+
+    Cold is one CREATE in a fresh process over a fresh store; warm is the
+    median of DROP+CREATE cycles on one live runtime (only the CREATE is
+    timed). The timed region is statement issue to statement return, so
+    source execution, indexing, and publication are all inside it.
+    """
+    if not (args.event_config and args.event_sql and args.event_name):
+        raise SystemExit(
+            "--event-config, --event-sql and --event-name are all required"
+        )
+    executions = 1 + args.warmups + args.runs
+    print(
+        "event-build executions this run: {0} CREATE statements "
+        "(1 cold + {1} warmup + {2} warm timed)".format(
+            executions, args.warmups, args.runs
+        )
+    )
+    records = _run_worker(_event_worker_cmd("event-cold", args))
+    records += _run_worker(_event_worker_cmd("event-warm", args))
+    for record in records:
+        _progress("new", "event", record["mode"], record["query"], record)
+    label = args.label or "event-{0}".format(args.event_name)
+    out_dir = os.path.join(HERE, "results", label)
+    os.makedirs(out_dir, exist_ok=True)
+    meta = {"git_commit": _git_commit(), "args": vars(args)}
+    results = {"meta": meta, "records": records}
+    with open(os.path.join(out_dir, "results.json"), "w") as handle:
+        json.dump(results, handle, indent=1)
+    by_mode = {}
+    for record in records:
+        by_mode[record["mode"]] = record
+    lines = [
+        "# Perf compare: CREATE EVENT DATASET {0} - {1}".format(args.event_name, label),
+        "",
+        "commit {0}; statement wall clock (issue to return), ms; cold = fresh "
+        "process + fresh store; warm = median of {1} DROP+CREATE cycles on one "
+        "live runtime.".format(results["meta"]["git_commit"], args.runs),
+        "",
+        "| case | cold total | warm total | status |",
+        "| --- | --- | --- | --- |",
+        "| {0} | {1} | {2} | {3} |".format(
+            args.event_name,
+            _cell_text(by_mode.get("cold-total"), "total_ms"),
+            _cell_text(by_mode.get("warm"), "total_ms"),
+            _new_status(
+                {(args.event_name, m): r for m, r in by_mode.items()},
+                args.event_name,
+            ),
+        ),
+    ]
+    report_path = os.path.join(out_dir, "REPORT.md")
+    with open(report_path, "w") as handle:
+        handle.write("\n".join(lines) + "\n")
+    print("wrote {0}".format(report_path))
+
+
 def _git_commit():
     """The current git commit id (for the report's reproducibility header)."""
     result = subprocess.run(
@@ -282,6 +357,9 @@ def main():
     parser.add_argument("--warmups", type=int, default=2)
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--skip-build", action="store_true")
+    parser.add_argument("--event-config", default=None)
+    parser.add_argument("--event-sql", default=None)
+    parser.add_argument("--event-name", default=None)
     parser.add_argument(
         "--old-engine-cmd",
         default=None,
@@ -292,6 +370,9 @@ def main():
 
     if not args.skip_build:
         _build_release()
+    if args.event_config or args.event_sql or args.event_name:
+        _run_event_build(args)
+        return
     queries = _all_queries() if args.queries == "all" else args.queries.split(",")
     sources = args.sources.split(",")
     engines = args.engines.split(",")

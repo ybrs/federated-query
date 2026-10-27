@@ -280,6 +280,78 @@ def _run_cold(make, fns, mode, query):
     _emit(record)
 
 
+def _event_runtime(config_path):
+    """One NEW-engine runtime over an event-build config file."""
+    import fedq
+
+    return fedq.Runtime(config_path)
+
+
+def _event_exists(runtime, name):
+    """Whether the runtime's store already holds the event dataset."""
+    import pyarrow as pa
+
+    table = pa.table(runtime.execute("SHOW EVENT DATASETS"))
+    return name in table.column(0).to_pylist()
+
+
+def _event_create(runtime, sql_path):
+    """Execute one CREATE EVENT DATASET statement; return its status text."""
+    with open(sql_path) as handle:
+        sql = handle.read()
+    result = runtime.execute(sql)
+    import pyarrow as pa
+
+    table = pa.table(result)
+    return table.column(0).to_pylist()[0]
+
+
+def _run_event_cold(args):
+    """One cold event build: this fresh process, one timed CREATE."""
+    record = {"query": args.event_name, "mode": "cold-total"}
+    try:
+        runtime = _event_runtime(args.event_config)
+        detail = {}
+
+        def create():
+            detail["text"] = _event_create(runtime, args.event_sql)
+
+        record["total_ms"], _ = _timed(create)
+        record["detail"] = detail.get("text", "")
+        record["status"] = "ok"
+    except Exception as error:  # classified and REPORTED, never swallowed
+        record["status"], record["message"] = _classify(error)
+    _emit(record)
+
+
+def _run_event_warm(args):
+    """Warm event builds on one live runtime: DROP, then a timed CREATE."""
+    record = {"query": args.event_name, "mode": "warm"}
+    try:
+        runtime = _event_runtime(args.event_config)
+        totals = []
+        details = []
+        for index in range(args.warmups + args.runs):
+            if _event_exists(runtime, args.event_name):
+                runtime.execute("DROP EVENT DATASET " + args.event_name)
+            detail = {}
+
+            def create():
+                detail["text"] = _event_create(runtime, args.event_sql)
+
+            elapsed, _ = _timed(create)
+            if index >= args.warmups:
+                totals.append(elapsed)
+                details.append(detail.get("text", ""))
+        record["total_ms"] = _median(totals)
+        record["runs_ms"] = totals
+        record["detail"] = details[-1] if details else ""
+        record["status"] = "ok"
+    except Exception as error:  # classified and REPORTED, never swallowed
+        record["status"], record["message"] = _classify(error)
+    _emit(record)
+
+
 def _run_warm(make, fns, queries, warmups, runs):
     """Warm medians per query on ONE shared runtime (a live session)."""
     try:
@@ -330,11 +402,16 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--engine", required=True, choices=["new"])
     parser.add_argument(
-        "--source", required=True, choices=["duck", "parquet", "pgduck"]
+        "--source", required=True, choices=["duck", "parquet", "pgduck", "event"]
     )
     parser.add_argument(
-        "--mode", required=True, choices=["cold-plan", "cold-total", "warm"]
+        "--mode",
+        required=True,
+        choices=["cold-plan", "cold-total", "warm", "event-cold", "event-warm"],
     )
+    parser.add_argument("--event-config", default=None)
+    parser.add_argument("--event-sql", default=None)
+    parser.add_argument("--event-name", default=None)
     parser.add_argument(
         "--queries", required=True, help="comma-separated, e.g. q01,q06"
     )
@@ -346,6 +423,16 @@ def main():
     args = parser.parse_args()
 
     os.environ["FEDQRS_PROFILE"] = "1"
+    if args.mode in ("event-cold", "event-warm"):
+        if not (args.event_config and args.event_sql and args.event_name):
+            raise SystemExit(
+                "event modes need --event-config, --event-sql, --event-name"
+            )
+        if args.mode == "event-cold":
+            _run_event_cold(args)
+        else:
+            _run_event_warm(args)
+        return
     queries = args.queries.split(",")
     make, fns = _build_new(args.source, args), _new_fns
     if args.mode == "warm":

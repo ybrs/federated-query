@@ -23,7 +23,7 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType as ArrowType, SchemaRef, TimeUnit as ArrowTimeUnit};
 
-use fq_common::events::TimeUnit;
+use fq_common::events::{Tiebreak, TimeUnit};
 
 use crate::dict::BuildDicts;
 use crate::error::{
@@ -32,8 +32,8 @@ use crate::error::{
 use crate::format::{encode_act, ActorSidecar, PropCell, SegEncoder};
 use crate::model::FastMap;
 use crate::model::{
-    hash_key, push_binary_key, push_int_key, push_utf8_key, PropertyDef, PropertyEncoding,
-    ShardFileEntry,
+    describe_key, hash_key, push_binary_key, push_int_key, push_utf8_key, PropertyDef,
+    PropertyEncoding, ShardFileEntry,
 };
 use crate::store::StoreIo;
 
@@ -56,7 +56,7 @@ pub struct BuildSpec {
     pub actor_column: String,
     pub time_column: String,
     pub event_column: String,
-    pub tiebreak_column: Option<String>,
+    pub tiebreak: Tiebreak,
     /// The declared property names; None means every remaining column.
     pub properties: Option<Vec<String>>,
     pub time_unit: TimeUnit,
@@ -142,6 +142,34 @@ enum IntKind {
     Int32,
 }
 
+/// How one composite ordering column's values encode into an order key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OrderKind {
+    Int64,
+    Int32,
+    UInt64,
+    UInt32,
+    Str(StrKind),
+    Binary,
+    FixedBinary,
+}
+
+/// The resolved tiebreak: the synthetic ordinal, one integer column whose
+/// value persists, or composite ordering columns the finalize ranks.
+#[derive(Clone)]
+enum TiebreakLayout {
+    Ordinal,
+    Column(usize, IntKind),
+    Ordering(Vec<(usize, OrderKind)>),
+}
+
+impl TiebreakLayout {
+    /// Whether rows carry composite order keys instead of an i64 tiebreak.
+    fn is_ordering(&self) -> bool {
+        matches!(self, TiebreakLayout::Ordering(_))
+    }
+}
+
 /// The resolved source layout: column indices plus access kinds, validated
 /// once against the first batch's schema.
 struct SourceLayout {
@@ -149,7 +177,7 @@ struct SourceLayout {
     actor: (usize, ActorKind),
     time: (usize, TimeKind),
     event: (usize, StrKind),
-    tiebreak: Option<(usize, IntKind)>,
+    tiebreak: TiebreakLayout,
     props: Vec<(usize, PropertyDef)>,
     /// Per property: its build-dictionary slot (dict-encoded props only).
     dict_slots: Vec<Option<usize>>,
@@ -248,15 +276,16 @@ fn property_def(column: &str, ty: &ArrowType, nullable: bool) -> Result<Property
     })
 }
 
-/// Resolve the whole source layout against the first batch's schema.
-fn resolve_layout(schema: &SchemaRef, spec: &BuildSpec) -> Result<SourceLayout, EventError> {
-    let actor_index = column_index(schema, &spec.actor_column)?;
-    let time_index = column_index(schema, &spec.time_column)?;
-    let event_index = column_index(schema, &spec.event_column)?;
-    let mut reserved = vec![actor_index, time_index, event_index];
-    let tiebreak = match &spec.tiebreak_column {
-        None => None,
-        Some(column) => {
+/// Resolve the declared tiebreak against the schema, reserving its columns
+/// so they never double as properties.
+fn resolve_tiebreak_layout(
+    schema: &SchemaRef,
+    spec: &BuildSpec,
+    reserved: &mut Vec<usize>,
+) -> Result<TiebreakLayout, EventError> {
+    match &spec.tiebreak {
+        Tiebreak::Ordinal => Ok(TiebreakLayout::Ordinal),
+        Tiebreak::Column(column) => {
             let index = column_index(schema, column)?;
             reserved.push(index);
             let kind = match schema.field(index).data_type() {
@@ -270,9 +299,35 @@ fn resolve_layout(schema: &SchemaRef, spec: &BuildSpec) -> Result<SourceLayout, 
                     .into())
                 }
             };
-            Some((index, kind))
+            Ok(TiebreakLayout::Column(index, kind))
         }
-    };
+        Tiebreak::Ordering(columns) => {
+            let mut resolved = Vec::with_capacity(columns.len());
+            for column in columns {
+                let index = column_index(schema, column)?;
+                if reserved.contains(&index) {
+                    return Err(EventTypeError::TiebreakType {
+                        column: column.clone(),
+                        found: "already named as actor/time/event or another ordering column"
+                            .to_string(),
+                    }
+                    .into());
+                }
+                reserved.push(index);
+                resolved.push((index, order_kind(column, schema.field(index).data_type())?));
+            }
+            Ok(TiebreakLayout::Ordering(resolved))
+        }
+    }
+}
+
+/// Resolve the whole source layout against the first batch's schema.
+fn resolve_layout(schema: &SchemaRef, spec: &BuildSpec) -> Result<SourceLayout, EventError> {
+    let actor_index = column_index(schema, &spec.actor_column)?;
+    let time_index = column_index(schema, &spec.time_column)?;
+    let event_index = column_index(schema, &spec.event_column)?;
+    let mut reserved = vec![actor_index, time_index, event_index];
+    let tiebreak = resolve_tiebreak_layout(schema, spec, &mut reserved)?;
     let property_names: Vec<String> = match &spec.properties {
         Some(names) => names.clone(),
         None => schema
@@ -360,6 +415,10 @@ struct ShardBuffer {
     actors: Vec<u32>,
     ts: Vec<i64>,
     tiebreak: Vec<i64>,
+    /// Composite order keys, flat: per-row lengths plus concatenated bytes.
+    /// Empty unless the build orders by composite columns.
+    order_lens: Vec<u32>,
+    order_bytes: Vec<u8>,
     event: Vec<u64>,
     props: Vec<PropSpill>,
     bytes: usize,
@@ -422,6 +481,8 @@ impl ShardBuffer {
             actors: Vec::new(),
             ts: Vec::new(),
             tiebreak: Vec::new(),
+            order_lens: Vec::new(),
+            order_bytes: Vec::new(),
             event: Vec::new(),
             props: props
                 .iter()
@@ -447,8 +508,15 @@ impl ShardBuffer {
         for value in &self.ts {
             payload.extend_from_slice(&value.to_le_bytes());
         }
-        for value in &self.tiebreak {
-            payload.extend_from_slice(&value.to_le_bytes());
+        if self.order_lens.is_empty() {
+            for value in &self.tiebreak {
+                payload.extend_from_slice(&value.to_le_bytes());
+            }
+        } else {
+            for len in &self.order_lens {
+                crate::format::put_varint(&mut payload, u64::from(*len));
+            }
+            payload.extend_from_slice(&self.order_bytes);
         }
         for code in &self.event {
             crate::format::put_varint(&mut payload, *code);
@@ -459,6 +527,8 @@ impl ShardBuffer {
         self.actors.clear();
         self.ts.clear();
         self.tiebreak.clear();
+        self.order_lens.clear();
+        self.order_bytes.clear();
         self.event.clear();
         for prop in &mut self.props {
             clear_prop(prop);
@@ -540,6 +610,9 @@ struct SpillColumns {
     actors: Vec<u32>,
     ts: Vec<i64>,
     tiebreak: Vec<i64>,
+    /// Composite order keys as offsets into `order_bytes` (rows + 1 entries).
+    order_offsets: Vec<u64>,
+    order_bytes: Vec<u8>,
     event: Vec<u64>,
     props: Vec<PropColumns>,
 }
@@ -573,6 +646,11 @@ impl SpillColumns {
     /// Rows held.
     fn rows(&self) -> usize {
         self.actors.len()
+    }
+
+    /// The composite order key of row `row`.
+    fn order_key(&self, row: usize) -> &[u8] {
+        &self.order_bytes[self.order_offsets[row] as usize..self.order_offsets[row + 1] as usize]
     }
 
     /// The property cell of row `row` for property `prop` under the final
@@ -668,6 +746,7 @@ fn read_frames(
 fn append_frame(
     payload: &[u8],
     props: &[(usize, PropertyDef)],
+    composite: bool,
     columns: &mut SpillColumns,
 ) -> Result<(), EventError> {
     let file = "spill";
@@ -711,10 +790,28 @@ fn append_frame(
         raw.copy_from_slice(chunk);
         columns.ts.push(i64::from_le_bytes(raw));
     }
-    for chunk in reader.take(rows * 8).map_err(map_err)?.chunks_exact(8) {
-        let mut raw = [0u8; 8];
-        raw.copy_from_slice(chunk);
-        columns.tiebreak.push(i64::from_le_bytes(raw));
+    if composite {
+        if columns.order_offsets.is_empty() {
+            columns.order_offsets.push(0);
+        }
+        let mut total = *columns.order_offsets.last().expect("offsets seeded");
+        let mut byte_total = 0u64;
+        for _ in 0..rows {
+            let len = reader.varint().map_err(map_err)?;
+            total += len;
+            byte_total += len;
+            columns.order_offsets.push(total);
+        }
+        columns
+            .order_bytes
+            .extend_from_slice(reader.take(byte_total as usize).map_err(map_err)?);
+        columns.tiebreak.resize(columns.actors.len(), 0);
+    } else {
+        for chunk in reader.take(rows * 8).map_err(map_err)?.chunks_exact(8) {
+            let mut raw = [0u8; 8];
+            raw.copy_from_slice(chunk);
+            columns.tiebreak.push(i64::from_le_bytes(raw));
+        }
     }
     for _ in 0..rows {
         columns.event.push(reader.varint().map_err(map_err)?);
@@ -1076,9 +1173,27 @@ fn push_rows(
     let rows = batch.num_rows();
     let actor = ActorAccessor::new(batch.column(layout.actor.0), layout.actor.1);
     let time = TimeAccessor::new(batch.column(layout.time.0), layout.time.1);
-    let tiebreak = layout
-        .tiebreak
-        .map(|(index, kind)| TiebreakAccessor::new(batch.column(index), kind));
+    let tiebreak = match &layout.tiebreak {
+        TiebreakLayout::Column(index, kind) => Some(TiebreakAccessor::new(
+            batch.column(*index),
+            *kind,
+            batch.schema().field(*index).name().clone(),
+        )),
+        TiebreakLayout::Ordinal | TiebreakLayout::Ordering(_) => None,
+    };
+    let ordering: Vec<OrderAccessor<'_>> = match &layout.tiebreak {
+        TiebreakLayout::Ordering(columns) => columns
+            .iter()
+            .map(|(index, kind)| {
+                OrderAccessor::new(
+                    batch.column(*index),
+                    *kind,
+                    batch.schema().field(*index).name().clone(),
+                )
+            })
+            .collect(),
+        TiebreakLayout::Ordinal | TiebreakLayout::Column(..) => Vec::new(),
+    };
     let times = time.fill(rows, job.start_ordinal)?;
     let mut key_lens: Vec<u32> = Vec::with_capacity(rows);
     let mut key_bytes: Vec<u8> = Vec::with_capacity(rows * 16);
@@ -1099,14 +1214,30 @@ fn push_rows(
         let hash = hashes[row];
         let shard = (hash & u64::from(partition.shards - 1)) as usize;
         let actor = partition.actors.code_of(hash, key)?;
-        let tb = match &tiebreak {
-            Some(accessor) => accessor.value(row, global_row)?,
-            None => i64::try_from(global_row).expect("ordinal fits i64"),
-        };
         let buffer = &mut buffers[shard];
-        buffer.actors.push(actor);
-        buffer.ts.push(times[row]);
-        buffer.tiebreak.push(tb);
+        if ordering.is_empty() {
+            let tb = match &tiebreak {
+                Some(accessor) => accessor.value(row, global_row)?,
+                None => i64::try_from(global_row).expect("ordinal fits i64"),
+            };
+            buffer.actors.push(actor);
+            buffer.ts.push(times[row]);
+            buffer.tiebreak.push(tb);
+        } else {
+            let start = buffer.order_bytes.len();
+            for accessor in &ordering {
+                if let Err(error) = accessor.encode(row, global_row, &mut buffer.order_bytes) {
+                    buffer.order_bytes.truncate(start);
+                    return Err(error);
+                }
+            }
+            buffer.bytes += buffer.order_bytes.len() - start;
+            buffer.actors.push(actor);
+            buffer.ts.push(times[row]);
+            buffer
+                .order_lens
+                .push(u32::try_from(buffer.order_bytes.len() - start).expect("order key fits u32"));
+        }
         buffer.event.push(*event_code);
         buffer.bytes += 25;
         push_prop_row(batch, layout, prop_codes, row, buffer);
@@ -1435,33 +1566,160 @@ impl<'a> TimeAccessor<'a> {
 }
 
 /// The declared tiebreak column accessor.
-enum TiebreakAccessor<'a> {
+struct TiebreakAccessor<'a> {
+    column: String,
+    kind: TiebreakKind<'a>,
+}
+
+/// The array backing of a single-column tiebreak accessor.
+enum TiebreakKind<'a> {
     Int64(&'a Int64Array),
     Int32(&'a Int32Array),
 }
 
 impl<'a> TiebreakAccessor<'a> {
     /// Downcast the tiebreak array per its resolved kind.
-    fn new(array: &'a Arc<dyn Array>, kind: IntKind) -> Self {
+    fn new(array: &'a Arc<dyn Array>, kind: IntKind, column: String) -> Self {
         let any = array.as_any();
-        match kind {
-            IntKind::Int64 => TiebreakAccessor::Int64(any.downcast_ref().expect("i64 tiebreak")),
-            IntKind::Int32 => TiebreakAccessor::Int32(any.downcast_ref().expect("i32 tiebreak")),
-        }
+        let kind = match kind {
+            IntKind::Int64 => TiebreakKind::Int64(any.downcast_ref().expect("i64 tiebreak")),
+            IntKind::Int32 => TiebreakKind::Int32(any.downcast_ref().expect("i32 tiebreak")),
+        };
+        Self { column, kind }
     }
 
     /// Row `row`'s tiebreak value; a null tiebreak raises (it could not order
     /// the row).
     fn value(&self, row: usize, global_row: u64) -> Result<i64, EventError> {
-        let (null, value) = match self {
-            TiebreakAccessor::Int64(array) => (array.is_null(row), array.value(row)),
-            TiebreakAccessor::Int32(array) => (array.is_null(row), i64::from(array.value(row))),
+        let (null, value) = match &self.kind {
+            TiebreakKind::Int64(array) => (array.is_null(row), array.value(row)),
+            TiebreakKind::Int32(array) => (array.is_null(row), i64::from(array.value(row))),
         };
         if null {
-            return Err(EventBuildError::NullTime { row: global_row }.into());
+            return Err(EventBuildError::NullTiebreak {
+                column: self.column.clone(),
+                row: global_row,
+            }
+            .into());
         }
         Ok(value)
     }
+}
+
+/// Resolve one composite ordering column's access kind; any other type
+/// raises naming the column.
+fn order_kind(column: &str, ty: &ArrowType) -> Result<OrderKind, EventError> {
+    match ty {
+        ArrowType::Int64 => Ok(OrderKind::Int64),
+        ArrowType::Int32 => Ok(OrderKind::Int32),
+        ArrowType::UInt64 => Ok(OrderKind::UInt64),
+        ArrowType::UInt32 => Ok(OrderKind::UInt32),
+        ArrowType::Utf8 => Ok(OrderKind::Str(StrKind::Utf8)),
+        ArrowType::LargeUtf8 => Ok(OrderKind::Str(StrKind::LargeUtf8)),
+        ArrowType::Utf8View => Ok(OrderKind::Str(StrKind::Utf8View)),
+        ArrowType::Binary => Ok(OrderKind::Binary),
+        ArrowType::FixedSizeBinary(_) => Ok(OrderKind::FixedBinary),
+        other => Err(EventTypeError::TiebreakType {
+            column: column.to_string(),
+            found: other.to_string(),
+        }
+        .into()),
+    }
+}
+
+/// One composite ordering column's accessor: appends the row's value to an
+/// order key in a byte form whose lexicographic order is the value order.
+struct OrderAccessor<'a> {
+    column: String,
+    kind: OrderKind,
+    array: &'a Arc<dyn Array>,
+}
+
+impl<'a> OrderAccessor<'a> {
+    /// Bind the accessor to its batch column.
+    fn new(array: &'a Arc<dyn Array>, kind: OrderKind, column: String) -> Self {
+        Self {
+            column,
+            kind,
+            array,
+        }
+    }
+
+    /// Append row `row`'s encoded value to `out`; a null raises.
+    fn encode(&self, row: usize, global_row: u64, out: &mut Vec<u8>) -> Result<(), EventError> {
+        if self.array.is_null(row) {
+            return Err(EventBuildError::NullTiebreak {
+                column: self.column.clone(),
+                row: global_row,
+            }
+            .into());
+        }
+        let any = self.array.as_any();
+        match self.kind {
+            OrderKind::Int64 => {
+                let value = any
+                    .downcast_ref::<Int64Array>()
+                    .expect("i64 ordering")
+                    .value(row);
+                out.extend_from_slice(&(value as u64 ^ 0x8000_0000_0000_0000).to_be_bytes());
+            }
+            OrderKind::Int32 => {
+                let value = any
+                    .downcast_ref::<Int32Array>()
+                    .expect("i32 ordering")
+                    .value(row);
+                out.extend_from_slice(
+                    &(i64::from(value) as u64 ^ 0x8000_0000_0000_0000).to_be_bytes(),
+                );
+            }
+            OrderKind::UInt64 => {
+                let value = any
+                    .downcast_ref::<arrow::array::UInt64Array>()
+                    .expect("u64 ordering")
+                    .value(row);
+                out.extend_from_slice(&value.to_be_bytes());
+            }
+            OrderKind::UInt32 => {
+                let value = any
+                    .downcast_ref::<arrow::array::UInt32Array>()
+                    .expect("u32 ordering")
+                    .value(row);
+                out.extend_from_slice(&u64::from(value).to_be_bytes());
+            }
+            OrderKind::Str(_) => push_order_bytes(out, string_value(self.array, row).as_bytes()),
+            OrderKind::Binary => {
+                let value = any
+                    .downcast_ref::<BinaryArray>()
+                    .expect("binary ordering")
+                    .value(row);
+                push_order_bytes(out, value);
+            }
+            OrderKind::FixedBinary => {
+                let value = any
+                    .downcast_ref::<FixedSizeBinaryArray>()
+                    .expect("fixed binary ordering")
+                    .value(row);
+                push_order_bytes(out, value);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Append byte-string `value` to an order key: zero bytes escape as
+/// (0, 0xFF) and (0, 0) terminates, so lexicographic key order is the
+/// lexicographic byte order of the values, column by column.
+fn push_order_bytes(out: &mut Vec<u8>, value: &[u8]) {
+    for byte in value {
+        if *byte == 0 {
+            out.push(0);
+            out.push(0xFF);
+        } else {
+            out.push(*byte);
+        }
+    }
+    out.push(0);
+    out.push(0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1870,6 +2128,7 @@ fn finalize_one_shard(
     peak_shard_budget: u64,
 ) -> Result<ShardResult, EventError> {
     let spill_path = build_dir.join(format!("spill-{shard:04}.tmp"));
+    let composite = layout.tiebreak.is_ordering();
     if spilled_bytes == 0 {
         std::fs::remove_file(&spill_path).ok();
         return Ok(ShardResult {
@@ -1884,6 +2143,7 @@ fn finalize_one_shard(
             io,
             location,
             params,
+            composite,
             &layout_props(layout),
             dicts,
             actor_table,
@@ -1933,8 +2193,9 @@ fn finalize_in_memory(
     shard: usize,
 ) -> Result<ShardResult, EventError> {
     let mut columns = SpillColumns::default();
+    let composite = layout.tiebreak.is_ordering();
     read_frames(spill_path, |payload| {
-        append_frame(payload, &layout.props, &mut columns)
+        append_frame(payload, &layout.props, composite, &mut columns)
     })?;
     let rows = columns.rows();
     let assignment = assign_local_ids(&columns, actor_table, priors, shard as u32)?;
@@ -1942,15 +2203,19 @@ fn finalize_in_memory(
     // comparison per element instead of three random array loads per key
     // evaluation (the closure-keyed sort was the finalize hot spot).
     let mut keyed: Vec<(u64, i64, i64, u32)> = Vec::with_capacity(rows);
-    for row in 0..rows {
-        keyed.push((
-            assignment.row_locals[row],
-            columns.ts[row],
-            columns.tiebreak[row],
-            row as u32,
-        ));
+    if composite {
+        keyed = rank_ordering_rows(&columns, &assignment, actor_table)?;
+    } else {
+        for row in 0..rows {
+            keyed.push((
+                assignment.row_locals[row],
+                columns.ts[row],
+                columns.tiebreak[row],
+                row as u32,
+            ));
+        }
+        keyed.sort_unstable();
     }
-    keyed.sort_unstable();
     let promoted = promotion_flags(layout, dicts);
     let encodings = final_encodings(layout, &promoted);
     let mut encoder = SegEncoder::new(shard as u32, params.generation, &encodings);
@@ -1993,6 +2258,48 @@ fn finalize_in_memory(
         min_ts,
         max_ts,
     })
+}
+
+/// Sort composite-ordering rows by (local, ts, order key) and stamp each
+/// row's persisted tiebreak as its 1-based rank within its (local, ts)
+/// group. Two rows with an identical full ordering key raise, as their
+/// order is undefined.
+fn rank_ordering_rows(
+    columns: &SpillColumns,
+    assignment: &IdAssignment,
+    actor_table: &ActorTable,
+) -> Result<Vec<(u64, i64, i64, u32)>, EventError> {
+    let mut sorted: Vec<(u64, i64, &[u8], u32)> = Vec::with_capacity(columns.rows());
+    for row in 0..columns.rows() {
+        sorted.push((
+            assignment.row_locals[row],
+            columns.ts[row],
+            columns.order_key(row),
+            row as u32,
+        ));
+    }
+    sorted.sort_unstable();
+    let mut keyed = Vec::with_capacity(sorted.len());
+    let mut previous: Option<(u64, i64, &[u8])> = None;
+    let mut rank: i64 = 0;
+    for (local, ts, key, row) in sorted {
+        match previous {
+            Some((prev_local, prev_ts, prev_key)) if prev_local == local && prev_ts == ts => {
+                if prev_key == key {
+                    return Err(EventBuildError::AmbiguousOrder {
+                        actor_key: describe_key(actor_table.key(columns.actors[row as usize])),
+                        ts,
+                    }
+                    .into());
+                }
+                rank += 1;
+            }
+            _ => rank = 1,
+        }
+        previous = Some((local, ts, key));
+        keyed.push((local, ts, rank, row));
+    }
+    Ok(keyed)
 }
 
 /// Which dict properties ended the build promoted, positionally per property.
@@ -2249,12 +2556,13 @@ impl PropRowCell {
 pub(crate) fn append_frame_reader(
     path: &std::path::Path,
     props: &[PropertyDef],
+    composite: bool,
     mut on_chunk: impl FnMut(SpillChunk) -> Result<(), EventError>,
 ) -> Result<(), EventError> {
     let indexed: Vec<(usize, PropertyDef)> = props.iter().cloned().enumerate().collect();
     read_frames(path, |payload| {
         let mut columns = SpillColumns::default();
-        append_frame(payload, &indexed, &mut columns)?;
+        append_frame(payload, &indexed, composite, &mut columns)?;
         on_chunk(SpillChunk { columns })
     })
 }
@@ -2282,6 +2590,14 @@ impl SpillChunk {
             self.columns.tiebreak[row],
             self.columns.event[row],
         )
+    }
+
+    /// The composite order key of row `row` (empty outside ordering builds).
+    pub(crate) fn order_key(&self, row: usize) -> &[u8] {
+        if self.columns.order_offsets.is_empty() {
+            return &[];
+        }
+        self.columns.order_key(row)
     }
 
     /// The owned property cells of row `row` under final encodings; a

@@ -56,7 +56,7 @@ lowers to DataFusion's native physical UNNEST operator.
 
 Direct execution registered all 111 daily files and created firebase_events.
 The view count and an independent DuckDB scan both returned 1,227,190 events
-and 22,744 actors. joker_events was built with the same counts. Paths, funnels,
+and 22,744 actors. A second event dataset was built with the same counts. Paths, funnels,
 and retention returned results across separate CLI sessions. Nested CROSS JOIN
 and matching LEFT JOIN queries also returned results from the actual export.
 

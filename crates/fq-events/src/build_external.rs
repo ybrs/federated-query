@@ -32,6 +32,9 @@ struct RunRow {
     local: u64,
     ts: i64,
     tiebreak: i64,
+    /// The composite order key (empty outside ordering builds, where the
+    /// i64 tiebreak is the sort key).
+    order: Vec<u8>,
     event: u64,
     cells: Vec<PropRowCell>,
     key: Vec<u8>,
@@ -39,13 +42,18 @@ struct RunRow {
 
 impl RunRow {
     /// The total sort key.
-    fn sort_key(&self) -> (u64, i64, i64) {
-        (self.local, self.ts, self.tiebreak)
+    fn sort_key(&self) -> (u64, i64, i64, &[u8]) {
+        (self.local, self.ts, self.tiebreak, &self.order)
+    }
+
+    /// The owned merge-heap key.
+    fn heap_key(&self) -> (u64, i64, i64, Vec<u8>) {
+        (self.local, self.ts, self.tiebreak, self.order.clone())
     }
 
     /// Approximate held bytes, for run sizing.
     fn bytes(&self) -> usize {
-        let mut total = 48 + self.key.len();
+        let mut total = 48 + self.key.len() + self.order.len();
         for cell in &self.cells {
             total += match cell {
                 PropRowCell::Str(bytes) => 24 + bytes.len(),
@@ -66,6 +74,7 @@ pub(crate) fn finalize_external(
     io: &StoreIo,
     location: &str,
     params: &BuildParams,
+    composite: bool,
     props: &[PropertyDef],
     dicts: &BuildDicts,
     actor_table: &ActorTable,
@@ -75,10 +84,18 @@ pub(crate) fn finalize_external(
     shard: usize,
     peak_shard_budget: u64,
 ) -> Result<ShardResult, EventError> {
-    let assignment = assign_ids_streaming(props, actor_table, priors, spill_path, shard as u32)?;
+    let assignment = assign_ids_streaming(
+        props,
+        composite,
+        actor_table,
+        priors,
+        spill_path,
+        shard as u32,
+    )?;
     let promoted = promotion_flags(props, dicts);
     let run_paths = write_sorted_runs(
         props,
+        composite,
         &promoted,
         actor_table,
         promoted_values,
@@ -91,11 +108,38 @@ pub(crate) fn finalize_external(
     let mut encoder = SegEncoder::new(shard as u32, params.generation, &encodings);
     let mut min_ts = None;
     let mut max_ts = None;
+    let mut rank_state: Option<(u64, i64, Vec<u8>)> = None;
+    let mut rank: i64 = 0;
     merge_runs(&run_paths, props, |row| {
         min_ts = merge_min(min_ts, Some(row.ts));
         max_ts = merge_max(max_ts, Some(row.ts));
+        let tiebreak = if composite {
+            match &rank_state {
+                Some((prev_local, prev_ts, prev_key))
+                    if *prev_local == row.local && *prev_ts == row.ts =>
+                {
+                    if *prev_key == row.order {
+                        return Err(EventBuildError::AmbiguousOrder {
+                            actor_key: crate::model::describe_key(&row.key),
+                            ts: row.ts,
+                        });
+                    }
+                    rank += 1;
+                    rank
+                }
+                _ => {
+                    rank = 1;
+                    rank
+                }
+            }
+        } else {
+            row.tiebreak
+        };
+        if composite {
+            rank_state = Some((row.local, row.ts, row.order.clone()));
+        }
         let cells: Vec<PropCell<'_>> = row.cells.iter().map(PropRowCell::as_cell).collect();
-        encoder.push_row(row.local, row.ts, row.tiebreak, row.event, &cells, &row.key)?;
+        encoder.push_row(row.local, row.ts, tiebreak, row.event, &cells, &row.key)?;
         Ok(())
     })?;
     for path in &run_paths {
@@ -151,13 +195,14 @@ fn final_encodings(props: &[PropertyDef], promoted: &[bool]) -> Vec<PropertyEnco
 /// prior sidecars.
 fn assign_ids_streaming(
     props: &[PropertyDef],
+    composite: bool,
     actor_table: &ActorTable,
     priors: &[Arc<ActorSidecar>],
     spill_path: &std::path::Path,
     shard: u32,
 ) -> Result<IdAssignment, EventError> {
     let mut present = vec![false; actor_table.len()];
-    append_frame_reader(spill_path, props, |chunk| {
+    append_frame_reader(spill_path, props, composite, |chunk| {
         for row in 0..chunk.rows() {
             present[chunk.actor(row) as usize] = true;
         }
@@ -238,6 +283,7 @@ fn resolve_local(
 /// row-major lz4; returns the run paths.
 fn write_sorted_runs(
     props: &[PropertyDef],
+    composite: bool,
     promoted: &[bool],
     actor_table: &ActorTable,
     promoted_values: &[Option<Vec<String>>],
@@ -249,7 +295,7 @@ fn write_sorted_runs(
     let mut runs: Vec<std::path::PathBuf> = Vec::new();
     let mut buffer: Vec<RunRow> = Vec::new();
     let mut buffered_bytes = 0usize;
-    append_frame_reader(spill_path, props, |chunk| {
+    append_frame_reader(spill_path, props, composite, |chunk| {
         for row in 0..chunk.rows() {
             let (ts, tiebreak, event) = chunk.order(row);
             let code = chunk.actor(row);
@@ -259,6 +305,7 @@ fn write_sorted_runs(
                 local,
                 ts,
                 tiebreak,
+                order: chunk.order_key(row).to_vec(),
                 event,
                 cells: chunk.cells(promoted, promoted_values, row),
                 key,
@@ -284,7 +331,7 @@ fn flush_run(
     index: usize,
     buffer: &mut Vec<RunRow>,
 ) -> Result<std::path::PathBuf, EventError> {
-    buffer.sort_by_key(RunRow::sort_key);
+    buffer.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
     let path = spill_path.with_extension(format!("run{index}"));
     let mut file = std::io::BufWriter::new(
         std::fs::File::create(&path)
@@ -319,6 +366,8 @@ fn encode_run_row(row: &RunRow, out: &mut Vec<u8>) {
     out.extend_from_slice(&row.local.to_le_bytes());
     out.extend_from_slice(&row.ts.to_le_bytes());
     out.extend_from_slice(&row.tiebreak.to_le_bytes());
+    crate::format::put_varint(out, row.order.len() as u64);
+    out.extend_from_slice(&row.order);
     crate::format::put_varint(out, row.event);
     crate::format::put_varint(out, row.key.len() as u64);
     out.extend_from_slice(&row.key);
@@ -421,6 +470,8 @@ fn decode_run_row(
     let local = reader.u64()?;
     let ts = reader.i64()?;
     let tiebreak = reader.i64()?;
+    let order_len = reader.varint()? as usize;
+    let order = reader.take(order_len)?.to_vec();
     let event = reader.varint()?;
     let key_len = reader.varint()? as usize;
     let key = reader.take(key_len)?.to_vec();
@@ -449,6 +500,7 @@ fn decode_run_row(
         local,
         ts,
         tiebreak,
+        order,
         event,
         cells,
         key,
@@ -457,7 +509,7 @@ fn decode_run_row(
 
 /// Merge-heap entry set: each entry pairs a run head's `(local, ts, tiebreak)`
 /// sort key (reversed for min-first order) with the index of its run.
-type MergeHeap = BinaryHeap<(Reverse<(u64, i64, i64)>, usize)>;
+type MergeHeap = BinaryHeap<(Reverse<(u64, i64, i64, Vec<u8>)>, usize)>;
 
 /// K-way merge the sorted runs, feeding each row in `(local, ts, tiebreak)`
 /// order to `emit`.
@@ -473,7 +525,7 @@ fn merge_runs(
         let mut reader = RunReader::open(path, props.len())?;
         let head = reader.next_row()?;
         if let Some(row) = &head {
-            heap.push((Reverse(row.sort_key()), index));
+            heap.push((Reverse(row.heap_key()), index));
         }
         readers.push(reader);
         heads.push(head);
@@ -483,7 +535,7 @@ fn merge_runs(
         emit(row)?;
         let next = readers[index].next_row()?;
         if let Some(row) = &next {
-            heap.push((Reverse(row.sort_key()), index));
+            heap.push((Reverse(row.heap_key()), index));
         }
         heads[index] = next;
     }

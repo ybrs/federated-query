@@ -29,6 +29,31 @@ fn json_err(error: &serde_json::Error) -> EventStoreError {
     EventStoreError::Registry(format!("stored JSON column does not parse: {error}"))
 }
 
+/// The stored text of a dataset's tiebreak: NULL for the ingest ordinal, the
+/// plain column name for a single-column tiebreak, and a JSON array of the
+/// ordering columns for a composite ordering.
+fn encode_tiebreak(tiebreak: &fq_common::events::Tiebreak) -> Option<String> {
+    match tiebreak {
+        fq_common::events::Tiebreak::Ordinal => None,
+        fq_common::events::Tiebreak::Column(column) => Some(column.clone()),
+        fq_common::events::Tiebreak::Ordering(columns) => {
+            Some(serde_json::to_string(columns).expect("column names serialize"))
+        }
+    }
+}
+
+/// Read back the stored tiebreak text written by `encode_tiebreak`.
+fn decode_tiebreak(text: Option<String>) -> Result<fq_common::events::Tiebreak, EventStoreError> {
+    let Some(text) = text else {
+        return Ok(fq_common::events::Tiebreak::Ordinal);
+    };
+    if text.starts_with('[') {
+        let columns: Vec<String> = serde_json::from_str(&text).map_err(|error| json_err(&error))?;
+        return Ok(fq_common::events::Tiebreak::Ordering(columns));
+    }
+    Ok(fq_common::events::Tiebreak::Column(text))
+}
+
 impl Registry {
     /// Open (and migrate) the registry inside the stats SQLite at `path`.
     pub fn open(path: &std::path::Path) -> Result<Self, EventStoreError> {
@@ -144,7 +169,7 @@ impl Registry {
                 record.time_column,
                 record.time_unit,
                 record.event_column,
-                record.tiebreak_column,
+                encode_tiebreak(&record.tiebreak),
                 serde_json::to_string(&record.properties).map_err(|error| json_err(&error))?,
                 record.shards,
                 serde_json::to_string(&record.file_list).map_err(|error| json_err(&error))?,
@@ -316,7 +341,7 @@ fn row_to_record(
             time_column: row.get(5).map_err(|error| db_err(&error))?,
             time_unit: row.get(6).map_err(|error| db_err(&error))?,
             event_column: row.get(7).map_err(|error| db_err(&error))?,
-            tiebreak_column: row.get(8).map_err(|error| db_err(&error))?,
+            tiebreak: decode_tiebreak(row.get(8).map_err(|error| db_err(&error))?)?,
             properties,
             shards: row.get(10).map_err(|error| db_err(&error))?,
             file_list,
@@ -368,7 +393,7 @@ mod tests {
             time_column: "ts".to_string(),
             time_unit: "us".to_string(),
             event_column: "event_name".to_string(),
-            tiebreak_column: Some("seq".to_string()),
+            tiebreak: fq_common::events::Tiebreak::Column("seq".to_string()),
             properties: vec![PropertyDef {
                 name: "device".to_string(),
                 data_type: fq_common::DataType::Varchar,

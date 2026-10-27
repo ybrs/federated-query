@@ -33,6 +33,39 @@ pub enum TimeUnit {
     Millis,
 }
 
+/// How events sharing one actor and timestamp are ordered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Tiebreak {
+    /// No declared ordering: the synthetic ingest ordinal.
+    Ordinal,
+    /// One integer column whose value is the persisted order key.
+    Column(String),
+    /// Source columns compared lexicographically in the builder's shard
+    /// sort; the persisted order key is the 1-based rank of the row within
+    /// its (actor, timestamp) group in that order.
+    Ordering(Vec<String>),
+}
+
+impl Tiebreak {
+    /// The source columns this ordering reads (empty for the ordinal).
+    pub fn columns(&self) -> Vec<String> {
+        match self {
+            Tiebreak::Ordinal => Vec::new(),
+            Tiebreak::Column(column) => vec![column.clone()],
+            Tiebreak::Ordering(columns) => columns.clone(),
+        }
+    }
+
+    /// The human-readable form shown by SHOW EVENT DATASETS.
+    pub fn describe(&self) -> String {
+        match self {
+            Tiebreak::Ordinal => "synthetic".to_string(),
+            Tiebreak::Column(column) => column.clone(),
+            Tiebreak::Ordering(columns) => format!("({})", columns.join(", ")),
+        }
+    }
+}
+
 /// `CREATE EVENT DATASET` in typed form.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EventDatasetDef {
@@ -41,8 +74,8 @@ pub struct EventDatasetDef {
     pub actor_column: String,
     pub time_column: String,
     pub event_column: String,
-    /// The declared tiebreak column; None means the synthetic ingest ordinal.
-    pub tiebreak_column: Option<String>,
+    /// How same-(actor, timestamp) events are ordered.
+    pub tiebreak: Tiebreak,
     /// The declared property columns. None means every source column not named
     /// as actor/time/event/tiebreak; Some(empty) means no properties.
     pub properties: Option<Vec<String>>,

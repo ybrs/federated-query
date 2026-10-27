@@ -20,7 +20,7 @@ use arrow::datatypes::{DataType as ArrowType, Field, Schema, TimeUnit as ArrowTi
 use fq_common::events::{
     BucketGrain, EventDatasetDef, EventMatch, EventSource, EventsConfig, FunnelMode, FunnelSpec,
     PathAnchor, PathsSpec, PeriodGrain, RetentionMode, RetentionSpec, SegmentMeasure, SegmentSpec,
-    TimeRange, TimeUnit, MICROS_PER_DAY,
+    Tiebreak, TimeRange, TimeUnit, MICROS_PER_DAY,
 };
 use fq_events::build::BatchSource;
 use fq_events::error::{EventError, EventStoreError};
@@ -153,7 +153,7 @@ fn dataset_def(name: &str) -> EventDatasetDef {
         actor_column: "actor".to_string(),
         time_column: "ts".to_string(),
         event_column: "name".to_string(),
-        tiebreak_column: Some("tb".to_string()),
+        tiebreak: Tiebreak::Column("tb".to_string()),
         properties: Some(vec!["device".to_string()]),
         shards: Some(4),
         refresh_key: None,
@@ -750,6 +750,182 @@ fn forced_spill_build_is_byte_identical_to_the_in_memory_build() {
         }
     }
     assert!(compared > 0, "no shard files compared");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// One composite-ordering source row: (actor, ts, event_id, uuid, name).
+type OrderingRow = (i64, i64, i64, Option<&'static str>, &'static str);
+
+/// Build the Arrow batch of a composite-ordering source.
+fn ordering_batch(rows: &[OrderingRow]) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("actor", ArrowType::Int64, false),
+        Field::new(
+            "ts",
+            ArrowType::Timestamp(ArrowTimeUnit::Microsecond, None),
+            false,
+        ),
+        Field::new("name", ArrowType::Utf8, false),
+        Field::new("event_id", ArrowType::Int64, false),
+        Field::new("uuid", ArrowType::Utf8, true),
+        Field::new("device", ArrowType::Utf8, true),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(
+                rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+            )),
+            Arc::new(TimestampMicrosecondArray::from(
+                rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.4).collect::<Vec<_>>(),
+            )),
+            Arc::new(Int64Array::from(
+                rows.iter().map(|row| row.2).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(
+                rows.iter().map(|row| row.3).collect::<Vec<_>>(),
+            )),
+            Arc::new(StringArray::from(vec![Some("phone"); rows.len()])),
+        ],
+    )
+    .expect("batch builds")
+}
+
+/// Create one dataset from an ordering batch under the given config.
+fn build_ordering(
+    store: &EventStore,
+    name: &str,
+    batch: RecordBatch,
+    config: &EventsConfig,
+) -> Result<fq_events::BuildReport, EventError> {
+    let def = EventDatasetDef {
+        tiebreak: Tiebreak::Ordering(vec!["event_id".to_string(), "uuid".to_string()]),
+        ..dataset_def(name)
+    };
+    let info = SourceInfo {
+        kind: "select".to_string(),
+        reference: "test".to_string(),
+        estimated_rows: None,
+        watermark: None,
+        source_token: None,
+    };
+    let mut source = VecSource {
+        batches: vec![batch].into_iter(),
+    };
+    store.create_dataset(&def, &info, &mut source, config)
+}
+
+/// Assert two datasets hold byte-identical shard files.
+fn assert_identical_shards(store: &EventStore, dir: &std::path::Path, a: &str, b: &str) {
+    let first = store.dataset(a).unwrap();
+    let second = store.dataset(b).unwrap();
+    assert_eq!(first.shard_files().len(), second.shard_files().len());
+    let mut compared = 0;
+    for ((_, first_files), (_, second_files)) in
+        first.shard_files().iter().zip(second.shard_files())
+    {
+        for (first_rel, second_rel) in first_files.iter().zip(second_files) {
+            let first_bytes = std::fs::read(dir.join("events").join(first_rel)).unwrap();
+            let second_bytes = std::fs::read(dir.join("events").join(second_rel)).unwrap();
+            assert_eq!(first_bytes, second_bytes, "shard files differ");
+            compared += 1;
+        }
+    }
+    assert!(compared > 0, "no shard files compared");
+}
+
+#[test]
+fn composite_ordering_matches_a_preranked_tiebreak_column() {
+    let (store, dir) = open_store("ordering");
+    // Input order is reversed within the tied (actor, ts) group; the ranks
+    // below are the (event_id, uuid) lexicographic order of that group.
+    let ordering_rows: Vec<OrderingRow> = vec![
+        (1, 100, 22, Some("b"), "second"),
+        (1, 100, 22, Some("a"), "first"),
+        (1, 100, 7, Some("z"), "zeroth"),
+        (1, 200, 1, Some("m"), "later"),
+        (2, 100, 22, Some("a"), "other"),
+    ];
+    let ranked_rows = vec![
+        Row {
+            actor: ActorId::Int(1),
+            ts: 100,
+            tiebreak: 3,
+            name: "second".to_string(),
+            device: Some("phone".to_string()),
+        },
+        Row {
+            actor: ActorId::Int(1),
+            ts: 100,
+            tiebreak: 2,
+            name: "first".to_string(),
+            device: Some("phone".to_string()),
+        },
+        Row {
+            actor: ActorId::Int(1),
+            ts: 100,
+            tiebreak: 1,
+            name: "zeroth".to_string(),
+            device: Some("phone".to_string()),
+        },
+        Row {
+            actor: ActorId::Int(1),
+            ts: 200,
+            tiebreak: 1,
+            name: "later".to_string(),
+            device: Some("phone".to_string()),
+        },
+        Row {
+            actor: ActorId::Int(2),
+            ts: 100,
+            tiebreak: 1,
+            name: "other".to_string(),
+            device: Some("phone".to_string()),
+        },
+    ];
+    build_dataset(&store, "ranked", &ranked_rows);
+    build_ordering(
+        &store,
+        "ordered",
+        ordering_batch(&ordering_rows),
+        &test_config(),
+    )
+    .unwrap();
+    assert_identical_shards(&store, &dir, "ranked", "ordered");
+    // The external sort-merge fallback ranks identically.
+    let mut spill_config = test_config();
+    spill_config.build_memory_bytes = 1;
+    build_ordering(
+        &store,
+        "ordered_spill",
+        ordering_batch(&ordering_rows),
+        &spill_config,
+    )
+    .unwrap();
+    assert_identical_shards(&store, &dir, "ranked", "ordered_spill");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn composite_ordering_rejects_duplicate_and_null_keys() {
+    let (store, dir) = open_store("ordering_bad");
+    let duplicate: Vec<OrderingRow> = vec![
+        (1, 100, 22, Some("a"), "one"),
+        (1, 100, 22, Some("a"), "two"),
+    ];
+    let error =
+        build_ordering(&store, "dup", ordering_batch(&duplicate), &test_config()).unwrap_err();
+    assert!(error.to_string().contains("equal tiebreak"), "{error}");
+    let null_key: Vec<OrderingRow> = vec![(1, 100, 22, None, "one")];
+    let error =
+        build_ordering(&store, "nullkey", ordering_batch(&null_key), &test_config()).unwrap_err();
+    assert!(
+        error.to_string().contains("tiebreak column 'uuid'"),
+        "{error}"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 

@@ -256,20 +256,22 @@ MIT License
 - "Unnesting Arbitrary Queries" (Neumann & Kemper, 2015)
 -
 
-### Native Gamester Parquet ingestion
+### Native Parquet ingestion
 
-`config/gamester-native.example.yaml` mounts one logical table over an explicit
+`config/native-parquet.example.yaml` mounts one logical table over an explicit
 manifest of the existing Parquet files. The manifest contains one path per line;
 relative entries resolve against the manifest's directory. Capture the selected
 source files before building. Missing, duplicate, or incompatible files raise.
 
-`examples/gamester-native.sql` builds the event dataset directly from that table.
-It decodes JSON-encoded event names, uses `COALESCE(user_id, device_id)` for the
-actor, and orders equal timestamps by `event_id`, then UUID. `ROW_NUMBER` converts
-that order into an integer tie-break column. UUID supplies a repeatable fallback
-when the source counter collides; it does not establish real-world chronology.
-The complete ordering key must distinguish events that need distinct ordering.
-This ordering can change paths and ordered funnels from a UUID-hash-based build.
+`examples/native-parquet-ingestion.sql` builds the event dataset directly from
+that table. It decodes JSON-encoded event names, uses
+`COALESCE(user_id, device_id)` for the actor, and declares
+`TIEBREAK (event_id, uuid)`: the builder orders equal timestamps by the source
+counter, then UUID, inside its shard sort and stamps each row's rank as the
+persisted tiebreak. UUID supplies a repeatable fallback when the source counter
+collides; it does not establish real-world chronology. The complete ordering key
+must distinguish events that need distinct ordering. This ordering can change
+paths and ordered funnels from a UUID-hash-based build.
 
 The native Parquet reader streams event dataset builds and rebuilds when their
 SELECT executes as one native source query. JSON extraction runs in the same

@@ -215,7 +215,7 @@ impl EventStore {
             actor_column: def.actor_column.clone(),
             time_column: def.time_column.clone(),
             event_column: def.event_column.clone(),
-            tiebreak_column: def.tiebreak_column.clone(),
+            tiebreak: def.tiebreak.clone(),
             properties: def.properties.clone(),
             time_unit: def.time_unit,
             declared,
@@ -299,7 +299,7 @@ impl EventStore {
                 TimeUnit::Millis => "ms".to_string(),
             },
             event_column: def.event_column.clone(),
-            tiebreak_column: def.tiebreak_column.clone(),
+            tiebreak: def.tiebreak.clone(),
             properties: outcome.properties.clone(),
             shards,
             file_list: FileList {
@@ -702,7 +702,7 @@ impl EventStore {
             actor_column: record.actor_column.clone(),
             time_column: record.time_column.clone(),
             event_column: record.event_column.clone(),
-            tiebreak_column: record.tiebreak_column.clone(),
+            tiebreak: record.tiebreak.clone(),
             properties: Some(
                 record
                     .properties

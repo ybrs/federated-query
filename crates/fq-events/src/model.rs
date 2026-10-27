@@ -294,8 +294,8 @@ pub struct DatasetRecord {
     pub time_column: String,
     pub time_unit: String,
     pub event_column: String,
-    /// The declared tiebreak column, or None for the synthetic ingest ordinal.
-    pub tiebreak_column: Option<String>,
+    /// How same-(actor, timestamp) events are ordered.
+    pub tiebreak: fq_common::events::Tiebreak,
     pub properties: Vec<PropertyDef>,
     pub shards: u32,
     pub file_list: FileList,

@@ -1,7 +1,7 @@
 datasources:
-  gamester_raw:
+  events_raw:
     type: parquet
-    manifest: /path/to/gamester-files.txt
+    manifest: /path/to/event-files.txt
 executor:
   max_threads: 2
   max_memory_mb: 512

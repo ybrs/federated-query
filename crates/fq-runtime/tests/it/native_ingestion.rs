@@ -97,9 +97,9 @@ fn config(root: &Path, files: &[PathBuf]) -> fq_common::Config {
     fq_common::load_config(path.to_str().unwrap()).unwrap()
 }
 
-/// Decode event names and produce a stable integer order from source counter then UUID.
+/// Decode event names and let the builder order tied timestamps by source counter then UUID.
 fn create_sql() -> &'static str {
-    "CREATE EVENT DATASET native_events AS (SELECT COALESCE(r.user_id,r.device_id) AS actor_id, r.ts AS event_time, json_extract_string(r.encoded, '$') AS event_name, CAST(ROW_NUMBER() OVER (PARTITION BY COALESCE(r.user_id,r.device_id),r.ts ORDER BY r.event_id,r.uuid) AS BIGINT) AS seq FROM raw.main.raw AS r) ACTOR actor_id TIME event_time EVENT event_name TIEBREAK seq PROPERTIES () WITH (time_unit='us')"
+    "CREATE EVENT DATASET native_events AS (SELECT COALESCE(r.user_id,r.device_id) AS actor_id, r.ts AS event_time, json_extract_string(r.encoded, '$') AS event_name, r.event_id AS event_id, r.uuid AS uuid FROM raw.main.raw AS r) ACTOR actor_id TIME event_time EVENT event_name TIEBREAK (event_id, uuid) PROPERTIES () WITH (time_unit='us')"
 }
 
 /// Require ordinary SQL CREATE, reopen, REBUILD and indexed paths to preserve ordering.

@@ -14,7 +14,7 @@
 use fq_common::events::{
     days_from_civil, BucketGrain, CompareOp, EventDatasetDef, EventMatch, EventPredicate,
     EventSource, FunnelMode, FunnelSpec, PathAnchor, PathsSpec, PeriodGrain, PredicateLiteral,
-    RetentionMode, RetentionSpec, SegmentMeasure, SegmentSpec, TimeRange, TimeUnit,
+    RetentionMode, RetentionSpec, SegmentMeasure, SegmentSpec, Tiebreak, TimeRange, TimeUnit,
 };
 
 use crate::error::ParseError;
@@ -46,11 +46,7 @@ pub(crate) fn classify_create_event<'a>(
     let time_column = identifier(tokens, "TIME column")?;
     tokens.expect_keyword("EVENT")?;
     let event_column = identifier(tokens, "EVENT column")?;
-    let tiebreak_column = if consume_keyword(tokens, "TIEBREAK") {
-        Some(identifier(tokens, "TIEBREAK column")?)
-    } else {
-        None
-    };
+    let tiebreak = parse_tiebreak(tokens)?;
     let properties = parse_properties(tokens)?;
     let (shards, refresh_key, time_unit, max_paths_depth) = parse_create_with(tokens)?;
     expect_end(tokens, "CREATE EVENT DATASET")?;
@@ -60,7 +56,7 @@ pub(crate) fn classify_create_event<'a>(
         actor_column,
         time_column,
         event_column,
-        tiebreak_column,
+        tiebreak,
         properties,
         shards,
         refresh_key,
@@ -95,6 +91,40 @@ fn parse_event_source(tokens: &mut Tokenizer<'_>) -> Result<EventSource, ParseEr
         schema,
         table,
     })
+}
+
+/// Parse the optional `TIEBREAK <column>` or `TIEBREAK ( <column>, ... )`
+/// clause. The parenthesized form names two or more source columns the
+/// builder compares lexicographically; a repeated column raises.
+fn parse_tiebreak(tokens: &mut Tokenizer<'_>) -> Result<Tiebreak, ParseError> {
+    if !consume_keyword(tokens, "TIEBREAK") {
+        return Ok(Tiebreak::Ordinal);
+    }
+    if !consume_char(tokens, '(') {
+        return Ok(Tiebreak::Column(identifier(tokens, "TIEBREAK column")?));
+    }
+    let mut columns = Vec::new();
+    loop {
+        let column = identifier(tokens, "TIEBREAK ordering column")?;
+        if columns.contains(&column) {
+            return Err(ParseError::Parse(format!(
+                "TIEBREAK ordering lists column '{column}' more than once"
+            )));
+        }
+        columns.push(column);
+        if consume_char(tokens, ')') {
+            break;
+        }
+        expect_char(tokens, ',', "TIEBREAK ordering list")?;
+    }
+    if columns.len() < 2 {
+        return Err(ParseError::Parse(
+            "TIEBREAK ( ... ) needs at least two ordering columns; a single \
+             column is written without parentheses"
+                .to_string(),
+        ));
+    }
+    Ok(Tiebreak::Ordering(columns))
 }
 
 /// Parse the optional `PROPERTIES ( <column> [, <column>]* )` clause. The
@@ -955,7 +985,7 @@ mod tests {
         assert_eq!(def.actor_column, "entity_id");
         assert_eq!(def.time_column, "ts");
         assert_eq!(def.event_column, "event_name");
-        assert_eq!(def.tiebreak_column.as_deref(), Some("seq"));
+        assert_eq!(def.tiebreak, Tiebreak::Column("seq".to_string()));
         assert_eq!(
             def.properties,
             Some(vec!["device".to_string(), "country".to_string()])
@@ -963,6 +993,32 @@ mod tests {
         assert_eq!(def.refresh_key.as_deref(), Some("seq"));
         assert_eq!(def.time_unit, TimeUnit::Micros);
         assert_eq!(def.shards, None);
+    }
+
+    #[test]
+    fn create_event_dataset_parses_composite_tiebreak() {
+        let statement = classify(
+            "CREATE EVENT DATASET web FROM ev.main.events \
+             ACTOR entity_id TIME ts EVENT event_name TIEBREAK (event_id, uuid)",
+        );
+        let Statement::CreateEventDataset(def) = statement else {
+            panic!("expected CreateEventDataset");
+        };
+        assert_eq!(
+            def.tiebreak,
+            Tiebreak::Ordering(vec!["event_id".to_string(), "uuid".to_string()])
+        );
+        for sql in [
+            "CREATE EVENT DATASET w FROM d.s.t ACTOR a TIME b EVENT c TIEBREAK (x)",
+            "CREATE EVENT DATASET w FROM d.s.t ACTOR a TIME b EVENT c TIEBREAK (x, x)",
+        ] {
+            assert!(classify_statement(sql).is_err(), "{sql}");
+        }
+        let statement = classify("CREATE EVENT DATASET w FROM d.s.t ACTOR a TIME b EVENT c");
+        let Statement::CreateEventDataset(def) = statement else {
+            panic!("expected CreateEventDataset");
+        };
+        assert_eq!(def.tiebreak, Tiebreak::Ordinal);
     }
 
     #[test]

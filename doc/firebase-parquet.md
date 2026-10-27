@@ -5,7 +5,7 @@ files with UNION ALL; the files stay in place. The event dataset is built from
 that view and supplies paths, funnels, and retention.
 
 An alternative with no view: register the matching daily files as ONE table,
-with `glob: '/data2/projects/joker-bigq-key/firebase-export/events_intraday_*.parquet'`
+with `glob: '/data/firebase-export/events_intraday_*.parquet'`
 or a `manifest` file listing one path per line. The engine merges the files'
 schemas by column name (a column absent from a file reads as NULL) and folds
 their footer row counts and statistics, so the event dataset reads one table.
@@ -18,20 +18,20 @@ activated. `make build` builds the CLI after installing the project dependencies
 ## Register the export
 
 ```bash
-mkdir -p event-analytics/joker
-cat > event-analytics/joker/fedq.yaml <<'YAML'
+mkdir -p event-analytics/firebase
+cat > event-analytics/firebase/fedq.yaml <<'YAML'
 datasources:
-  joker:
+  firebase:
     type: parquet
-    dir: /data2/projects/joker-bigq-key/firebase-export/
+    dir: /data/firebase-export/
 YAML
 
-target/release/fedq --config event-analytics/joker/fedq.yaml \
-  --command 'SHOW TABLES FROM joker'
+target/release/fedq --config event-analytics/firebase/fedq.yaml \
+  --command 'SHOW TABLES FROM firebase'
 ```
 
 For example, `events_intraday_20260313.parquet` is available as
-`joker.main.events_intraday_20260313`. The manifest is not a table. List and
+`firebase.main.events_intraday_20260313`. The manifest is not a table. List and
 struct columns retain their nested Arrow schemas.
 
 ## Combine daily tables
@@ -42,17 +42,17 @@ Explicit columns keep the view valid when later exports add unrelated columns.
 
 ```bash
 "$VIRTUAL_ENV/bin/python3" scripts/parquet_union_view.py \
-  /data2/projects/joker-bigq-key/firebase-export/ \
-  --source joker --view firebase_events \
+  /data/firebase-export/ \
+  --source firebase --view firebase_events \
   --pattern 'events_intraday_*.parquet' \
   --columns user_pseudo_id event_timestamp event_name platform geo device \
     event_params event_bundle_sequence_id batch_event_index \
-  > event-analytics/joker/create_view.sql
+  > event-analytics/firebase/create_view.sql
 
-target/release/fedq --config event-analytics/joker/fedq.yaml \
-  --file event-analytics/joker/create_view.sql
+target/release/fedq --config event-analytics/firebase/fedq.yaml \
+  --file event-analytics/firebase/create_view.sql
 
-target/release/fedq --config event-analytics/joker/fedq.yaml
+target/release/fedq --config event-analytics/firebase/fedq.yaml
 ```
 
 In the interactive shell:
@@ -84,14 +84,14 @@ SELECT e.user_pseudo_id, e.event_name,
        p.param.value.string_value AS text_value,
        p.param.value.int_value AS integer_value,
        p.position
-FROM joker.main.events_intraday_20260313 AS e
+FROM firebase.main.events_intraday_20260313 AS e
 CROSS JOIN UNNEST(e.event_params)
   WITH ORDINALITY AS p(param, position)
 LIMIT 20;
 
 SELECT e.user_pseudo_id, e.event_name,
        p.param.value.string_value AS screen_class
-FROM joker.main.events_intraday_20260313 AS e
+FROM firebase.main.events_intraday_20260313 AS e
 LEFT JOIN UNNEST(e.event_params) AS p(param)
   ON p.param.key = 'firebase_screen_class'
 LIMIT 20;
@@ -113,7 +113,7 @@ per event. Firebase timestamps are integer microseconds. The sequence orders
 simultaneous events by their bundle, batch position, and event name.
 
 ```sql
-CREATE EVENT DATASET joker_events AS (
+CREATE EVENT DATASET app_events AS (
   SELECT user_pseudo_id AS actor,
          event_timestamp AS ts,
          event_name AS event,
@@ -130,7 +130,7 @@ CREATE EVENT DATASET joker_events AS (
   WITH (time_unit = 'us');
 ```
 
-The definition is a SELECT, so use `REBUILD EVENT DATASET joker_events` to pick up
+The definition is a SELECT, so use `REBUILD EVENT DATASET app_events` to pick up
 changed input. Keep the config and its event store together across CLI sessions.
 
 ## Paths, funnels, and retention
@@ -139,16 +139,16 @@ These examples use event names present in this export:
 
 ```sql
 SELECT path_id, seq, event, occurrences, share
-FROM paths('joker_events', starting_at => 'first_open', depth => 4, top => 10)
+FROM paths('app_events', starting_at => 'first_open', depth => 4, top => 10)
 ORDER BY path_id, seq;
 
 SELECT step_index, step_name, entered, conversion_from_start
-FROM funnel('joker_events', 'first_open', 'tutorial_begin', 'tutorial_complete',
+FROM funnel('app_events', 'first_open', 'tutorial_begin', 'tutorial_complete',
             window => '7 days')
 ORDER BY step_index;
 
 SELECT cohort_start, cohort_size, period_offset, retained, retention_rate
-FROM retention('joker_events', birth => 'first_open', return => 'session_start',
+FROM retention('app_events', birth => 'first_open', return => 'session_start',
                period => 'day', periods => 8)
 ORDER BY cohort_start, period_offset
 LIMIT 32;
