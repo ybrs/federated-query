@@ -14,7 +14,6 @@
 pub mod budget;
 pub mod config;
 pub mod error;
-pub mod events;
 pub mod logging;
 mod nested_types;
 pub mod types;
@@ -53,7 +52,6 @@ pub use config::{
     SCRAM_ITERATIONS,
 };
 pub use error::{ConfigError, UnsupportedSqlError};
-pub use events::EventsConfig;
 pub use logging::setup_logging;
 pub use types::DataType;
 

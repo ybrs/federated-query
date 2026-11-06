@@ -15,11 +15,10 @@ use serde::{Deserialize, Serialize};
 use serde_yaml::{Mapping, Value};
 
 use crate::error::ConfigError;
-use crate::events::EventsConfig;
 
 /// The top-level sections `load_config` recognizes. Anything else is a typo and
 /// raises (`config.py`'s `known_sections`).
-const KNOWN_SECTIONS: [&str; 9] = [
+const KNOWN_SECTIONS: [&str; 8] = [
     "datasources",
     "optimizer",
     "executor",
@@ -27,7 +26,6 @@ const KNOWN_SECTIONS: [&str; 9] = [
     "server",
     "accelerator",
     "catalog",
-    "events",
     "diagnostics",
 ];
 
@@ -398,7 +396,6 @@ pub struct Config {
     pub server: ServerConfig,
     pub accelerator: AcceleratorConfig,
     pub catalog: CatalogConfig,
-    pub events: EventsConfig,
     pub diagnostics: DiagnosticsConfig,
     pub source_path: Option<String>,
 }
@@ -431,7 +428,6 @@ pub fn load_config(config_path: &str) -> Result<Config, ConfigError> {
         server,
         accelerator: parse_section(mapping, "accelerator")?,
         catalog: parse_section(mapping, "catalog")?,
-        events: parse_section(mapping, "events")?,
         diagnostics: parse_section(mapping, "diagnostics")?,
         source_path: Some(path.display().to_string()),
     })

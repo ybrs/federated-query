@@ -2,10 +2,9 @@
 //!
 //! One file next to the config (`<config-stem>.stats.sqlite`) holds the learned
 //! statistics, the persisted SET overrides, the dynamic-datasource registry, the
-//! materialized-view catalog, the user/grant store and the event-dataset
-//! registry. Every one of those steers plan choice or access, so a runtime whose
-//! state file vanished, was replaced, or stopped being a database is not
-//! degraded - it is in an UNKNOWN state.
+//! materialized-view catalog and the user/grant store. Every one of those
+//! steers plan choice or access, so a runtime whose state file vanished, was
+//! replaced, or stopped being a database is in an UNKNOWN state.
 //!
 //! That is fatal, and it is fatal ONCE: the loss is recorded on the runtime and
 //! every later call returns the same `RuntimeError::StateStoreLost` instead of
@@ -14,12 +13,11 @@
 //! misleading per-query failures hiding a single unrecoverable fault.
 //!
 //! The check runs at the runtime's call boundary rather than at each SQLite
-//! call: the file is shared by three subsystems whose errors carry different
-//! detail (fq-events flattens its rusqlite errors to a string), it runs BEFORE
-//! any work so the fatal loss is what the caller sees rather than whatever error
-//! the missing state happened to produce, and a deleted or replaced file is
-//! invisible to SQLite entirely - an open connection keeps reading the unlinked
-//! inode and would serve state no longer at that path.
+//! call: the file is shared by multiple subsystems. It runs BEFORE any work so
+//! the fatal loss is what the caller sees rather than whatever error the missing
+//! state happened to produce. A deleted or replaced file is invisible to SQLite
+//! entirely: an open connection keeps reading the unlinked inode and would serve
+//! state no longer at that path.
 
 use std::collections::BTreeSet;
 use std::os::unix::fs::MetadataExt;
@@ -216,8 +214,8 @@ fn sqlite_read_error(code: i32) -> String {
 fn fatal_message(path: &Path, detail: &str) -> String {
     format!(
         "FATAL: the engine state store {} {detail}. It holds the learned statistics, \
-         persisted settings, registered datasources, materialized views, users and \
-         event datasets this engine plans and authorizes with, so its state is now \
+         persisted settings, registered datasources, materialized views and users \
+         this engine plans and authorizes with, so its state is now \
          unknown and this runtime will run nothing further. This is not a query \
          failure: restart the engine over an intact store.",
         path.display()

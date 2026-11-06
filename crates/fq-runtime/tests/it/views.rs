@@ -1,7 +1,6 @@
 //! Non-materialized views end to end: CREATE / SHOW / DROP, expansion in a
-//! query, persistence across a runtime restart, the loud rejections, and the
-//! motivating case - a view over a CROSS-DATASOURCE join that an event dataset
-//! is then built on.
+//! query, persistence across a runtime restart, loud rejections, and
+//! cross-datasource joins exposed through views.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -75,7 +74,7 @@ fn write_parquet(path: &Path, schema: Arc<Schema>, columns: Vec<ArrayRef>) {
 }
 
 /// A config over the given single-file parquet datasources, with a source path
-/// so the runtime has a view/event store.
+/// so the runtime has a persistent view store.
 fn config_for(dir: &Path, sources: &[(&str, &Path)]) -> Config {
     let mut datasources = BTreeMap::new();
     for (name, file) in sources {
@@ -103,7 +102,6 @@ fn config_for(dir: &Path, sources: &[(&str, &Path)]) -> Config {
         server: ServerConfig::default(),
         accelerator: fq_common::AcceleratorConfig::default(),
         catalog: fq_common::CatalogConfig::default(),
-        events: fq_common::EventsConfig::default(),
         diagnostics: fq_common::DiagnosticsConfig::default(),
         source_path: Some(dir.join("config.yaml").to_string_lossy().to_string()),
     }
@@ -269,17 +267,6 @@ fn a_view_cannot_collide_with_any_other_relation_kind() {
     assert!(runtime
         .execute("CREATE VIEW mv AS SELECT user_id FROM eva.main.eva")
         .is_err());
-
-    // An event dataset's name is taken.
-    runtime
-        .execute(
-            "CREATE EVENT DATASET evs AS ( SELECT created_at AS ts, event AS ev, \
-             user_id AS uid FROM eva.main.eva ) ACTOR uid TIME ts EVENT ev",
-        )
-        .expect("create event dataset");
-    assert!(runtime
-        .execute("CREATE VIEW evs AS SELECT user_id FROM eva.main.eva")
-        .is_err());
 }
 
 #[test]
@@ -299,14 +286,6 @@ fn other_relation_kinds_cannot_collide_with_a_view() {
     // relation, so the create raises instead.
     assert!(runtime
         .execute("CREATE MATERIALIZED VIEW taken AS SELECT user_id FROM eva.main.eva")
-        .is_err());
-
-    // Same for an event dataset.
-    assert!(runtime
-        .execute(
-            "CREATE EVENT DATASET taken AS ( SELECT created_at AS ts, event AS ev, \
-             user_id AS uid FROM eva.main.eva ) ACTOR uid TIME ts EVENT ev",
-        )
         .is_err());
 
     // The view still resolves to its own definition.
@@ -343,7 +322,7 @@ fn a_cycle_through_a_second_view_raises() {
 }
 
 #[test]
-fn event_dataset_over_a_view_of_a_cross_source_join() {
+fn a_view_over_a_cross_source_join() {
     let dir = sandbox("crossjoin");
     let events = dir.join("ev.parquet");
     let users = dir.join("us.parquet");
@@ -361,26 +340,13 @@ fn event_dataset_over_a_view_of_a_cross_source_join() {
         )
         .expect("create cross-source view");
 
-    // The event dataset materializes from that view. `SELECT *` over the view
-    // expands to its declared output columns (the shape the tutorial shows).
-    runtime
-        .execute(
-            "CREATE EVENT DATASET web AS ( SELECT * FROM enriched ) \
-             ACTOR uid TIME ts EVENT ev PROPERTIES (country)",
-        )
-        .expect("event dataset over the view");
-
-    // Analytics over it, including a property that came from the JOINED source.
     let (_, batches) = runtime
-        .execute("SELECT sum(value) AS n FROM segment('web', measure => 'count', bucket => 'day')")
-        .expect("segment over view-sourced dataset");
+        .execute("SELECT count(*) AS n FROM enriched")
+        .expect("query cross-source view");
     assert_eq!(one_count(&batches), 3);
 
     let (_, batches) = runtime
-        .execute(
-            "SELECT sum(value) AS n FROM segment('web', measure => 'count', bucket => 'day', \
-             filter => 'country = ''US''')",
-        )
-        .expect("filtered segment");
+        .execute("SELECT count(*) AS n FROM enriched WHERE country = 'US'")
+        .expect("filter cross-source view");
     assert_eq!(one_count(&batches), 2);
 }

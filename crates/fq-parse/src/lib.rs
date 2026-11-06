@@ -15,7 +15,6 @@
 
 pub mod convert;
 pub mod error;
-mod events;
 pub mod expr;
 pub mod functions;
 mod nested;

@@ -24,14 +24,14 @@ use fq_optimize::{group_column_names, subplan_signature, CostModel};
 use fq_plan::expr::Expr;
 use fq_plan::logical::{
     Aggregate, Explain, Filter, GroupedLimit, LogicalPlan, Projection, Scan, SingleRowGuard,
-    SubqueryScan, TableFunction, Union, Values,
+    SubqueryScan, Union, Values,
 };
 use fq_plan::physical::DatasourceKind;
 use fq_plan::physical::{
     GroupObservation, PhysicalAliasedRelation, PhysicalExplain, PhysicalFilter,
     PhysicalGroupedLimit, PhysicalHashAggregate, PhysicalLimit, PhysicalPlan, PhysicalProjection,
-    PhysicalScan, PhysicalSingleRowGuard, PhysicalSort, PhysicalTableFunction, PhysicalUnion,
-    PhysicalValues, PhysicalWindow,
+    PhysicalScan, PhysicalSingleRowGuard, PhysicalSort, PhysicalUnion, PhysicalValues,
+    PhysicalWindow,
 };
 
 use crate::capability::{pushed_datasource, source_declares};
@@ -126,13 +126,6 @@ impl PhysicalPlanner {
         self
     }
 
-    /// Allow a source ingestion SELECT to render as one native streaming query.
-    #[must_use]
-    pub fn with_streaming_source(mut self, enabled: bool) -> Self {
-        self.single_source = self.single_source.with_streaming_source(enabled);
-        self
-    }
-
     /// Wire the learned-stats catalog (and its freshness bound) dim shipping reads
     /// measured group counts from. Pass the SAME `Arc<StatsCatalog>` and TTL the
     /// cost model's statistics collector holds, so the shipping gate reads the slot
@@ -195,7 +188,6 @@ impl PhysicalPlanner {
             LogicalPlan::LateralJoin(lj) => self.plan_lateral_join(lj),
             LogicalPlan::SingleRowGuard(g) => self.plan_single_row_guard(g),
             LogicalPlan::GroupedLimit(gl) => self.plan_grouped_limit(gl),
-            LogicalPlan::TableFunction(tf) => Ok(Self::plan_table_function(tf)),
             LogicalPlan::Unnest(node) => self.plan_unnest(node),
         }
     }
@@ -369,19 +361,6 @@ impl PhysicalPlanner {
         PhysicalPlan::Values(PhysicalValues {
             rows: values.rows.clone(),
             output_names: values.output_names.clone(),
-        })
-    }
-
-    /// Plan a table-valued analysis call: carry the spec and its surfaced schema
-    /// to the physical node unchanged. The analysis runs (into in-memory batches)
-    /// at execution, never at plan time - planning stays O(metadata).
-    fn plan_table_function(node: &TableFunction) -> PhysicalPlan {
-        // Fresh PhysicalTableFunction lowered from the logical node: a type change
-        // with no physical base to copy, so all three fields are listed.
-        PhysicalPlan::TableFunction(PhysicalTableFunction {
-            call: node.call.clone(),
-            alias: node.alias.clone(),
-            output_names: node.output_names.clone(),
         })
     }
 

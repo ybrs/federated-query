@@ -30,7 +30,7 @@
 //! THE RULE THAT DRIVES `exposure`: a node that INTRODUCES A NAME for a relation
 //! exposes that relation's output names under it. The nodes that introduce one
 //! are a scan (its alias, else its table), an aliased relation, a CTE definition
-//! and each reference to it, and a table function (its FROM alias). Every one of
+//! and each reference to it, and an UNNEST expansion (its FROM alias). Every one of
 //! them is modelled here; a new node that names a relation and is not added will
 //! reject valid plans, because a reference to that name resolves to nothing.
 //!
@@ -145,7 +145,6 @@ fn exposure(plan: &PhysicalPlan) -> BTreeSet<QualifiedColumn> {
         PhysicalPlan::AliasedRelation(aliased) => named_exposure(&aliased.alias, &aliased.input),
         PhysicalPlan::CteScan(scan) => cte_scan_exposure(scan),
         PhysicalPlan::Cte(cte) => cte_exposure(cte),
-        PhysicalPlan::TableFunction(call) => table_function_exposure(call),
         PhysicalPlan::Unnest(node) => unnest_exposure(node),
         other => children_exposure(other),
     }
@@ -227,19 +226,6 @@ fn cte_exposure(cte: &fq_plan::physical::PhysicalCte) -> BTreeSet<QualifiedColum
     exposed
 }
 
-/// A table function is a relation named by its FROM alias, so it exposes the
-/// columns it produces under that name. It reads no child, so nothing else
-/// beneath it could answer a reference to it.
-fn table_function_exposure(
-    call: &fq_plan::physical::PhysicalTableFunction,
-) -> BTreeSet<QualifiedColumn> {
-    let mut exposed = BTreeSet::new();
-    for output in &call.output_names {
-        exposed.insert((call.alias.clone(), output.clone()));
-    }
-    exposed
-}
-
 /// A CTE's column names: its declared list, else the names its body produces.
 fn cte_output_names(cte: &fq_plan::physical::PhysicalCte) -> Vec<String> {
     match &cte.column_names {
@@ -261,7 +247,6 @@ fn output_names(plan: &PhysicalPlan) -> Vec<String> {
         PhysicalPlan::HashAggregate(node) => node.output_names.clone(),
         PhysicalPlan::RemoteQuery(node) => node.output_names.clone(),
         PhysicalPlan::Values(node) => node.output_names.clone(),
-        PhysicalPlan::TableFunction(node) => node.output_names.clone(),
         PhysicalPlan::Unnest(_) => fq_plan::output_column_names(plan),
         PhysicalPlan::CteMergeQuery(node) => node.output_names.clone(),
         PhysicalPlan::LateralJoin(node) => node.output_names.clone(),

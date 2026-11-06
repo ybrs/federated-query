@@ -23,6 +23,14 @@ fn example_config_path() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/example_config.yaml")
 }
 
+/// Unsupported top-level configuration cannot be silently ignored.
+#[test]
+fn unsupported_analysis_config_raises() {
+    let path = write_temp("unsupported_analysis", "datasources: {}\nevents: {}\n");
+    assert!(load_config(path.to_str().unwrap()).is_err());
+    std::fs::remove_file(path).unwrap();
+}
+
 #[test]
 // Exact f64 compare is intended: the YAML literal and the expected literal are
 // the same value, so they are bit-identical (matches the Python test's `== 0.01`).

@@ -9,7 +9,7 @@ any hard-won lesson. The FULL text of every removed doc is in git history:
 
 Live design docs (NOT digested here, still authoritative):
 `HANDOFF.md`, `rewrite-python-to-rust-plan.md`, `README-architecture.md`,
-`accelerator-plan.md`, `events-plan.md`, `dim-shipping-open-problems.md`,
+`accelerator-plan.md`, `dim-shipping-open-problems.md`,
 `doc/node-mutation-and-concurrency.md`.
 
 ## Decorrelation

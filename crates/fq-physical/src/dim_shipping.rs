@@ -507,8 +507,7 @@ fn node_is_shippable(node: &LogicalPlan) -> bool {
         | LogicalPlan::SingleRowGuard(_)
         | LogicalPlan::GroupedLimit(_)
         | LogicalPlan::LateralJoin(_)
-        | LogicalPlan::Unnest(_)
-        | LogicalPlan::TableFunction(_) => false,
+        | LogicalPlan::Unnest(_) => false,
     }
 }
 

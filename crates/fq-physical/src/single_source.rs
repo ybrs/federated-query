@@ -233,23 +233,12 @@ enum NullableRight {
 /// datasource capabilities.
 pub struct SingleSourcePushdown {
     catalog: Arc<Catalog>,
-    streaming_source: bool,
 }
 
 impl SingleSourcePushdown {
     /// Build a pushdown pass over a shared catalog.
     pub fn new(catalog: Arc<Catalog>) -> Self {
-        Self {
-            catalog,
-            streaming_source: false,
-        }
-    }
-
-    /// Render plain source projections too when the caller consumes a source stream.
-    #[must_use]
-    pub fn with_streaming_source(mut self, enabled: bool) -> Self {
-        self.streaming_source = enabled;
-        self
+        Self { catalog }
     }
 
     /// Try to collapse a subtree living on one source into a single remote query.
@@ -266,7 +255,7 @@ impl SingleSourcePushdown {
         if !self.absorb(node, &mut ctx)? {
             return Ok(None);
         }
-        if !self.streaming_source && !should_push(&ctx) {
+        if !should_push(&ctx) {
             return Ok(None);
         }
         if ctx.select_exprs.is_empty() && !self.expand_star_select(&mut ctx) {
@@ -334,7 +323,6 @@ impl SingleSourcePushdown {
             | LogicalPlan::Explain(_)
             | LogicalPlan::SingleRowGuard(_)
             | LogicalPlan::GroupedLimit(_)
-            | LogicalPlan::TableFunction(_)
             | LogicalPlan::Unnest(_) => Ok(false),
         }
     }

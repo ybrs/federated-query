@@ -14,7 +14,6 @@ mod acl;
 mod delta;
 mod dynamic_catalog;
 pub mod error;
-mod events;
 mod explain;
 mod fragments;
 mod introspect;
@@ -51,12 +50,11 @@ use fq_plan::physical::PhysicalPlan;
 
 pub use error::RuntimeError;
 
-/// Source ingestion renders a single-source SELECT as one streaming source read.
+/// Query purpose controls materialized-view substitution.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum QueryPurpose {
     User,
     StoredSelect,
-    EventSource,
 }
 
 /// One assembled engine session: a shared catalog (metadata + statistics) plus
@@ -103,10 +101,6 @@ pub struct Runtime {
     /// implicit superuser with enforcement off; a wire connection calls
     /// `set_principal` to turn enforcement on.
     authz: RwLock<acl::AclState>,
-    /// The event-analytics store, opened lazily on the first event statement
-    /// (like the materialized-view store, it lives next to the config file;
-    /// a path-less config raises).
-    events: events::EventStoreSlot,
     /// The guard over the SQLite file every one of those stores lives in. It is
     /// checked at each call into the runtime; a store that vanished, was
     /// replaced, or stopped being a database POISONS the runtime, which then
@@ -201,28 +195,6 @@ impl Runtime {
         // alone - a session-cold source round trip can never be billed to
         // whichever query happened to plan over a table first.
         prewarm_source_statistics(&catalog, &stats)?;
-        // Prewarm the paths indexes on a background thread: the block cache
-        // is process-global, so a throwaway store handle warms the same cache
-        // the session's store reads later. A prewarm failure only prints; the
-        // first event statement re-runs the load and raises loudly.
-        if let Some(source_path) = config.source_path.as_deref() {
-            let root = events::events_root_path(source_path);
-            if root.exists() {
-                let stats_path = stats_sqlite_path(config)
-                    .expect("a config with a source path has a stats path");
-                let events_config = config.events.clone();
-                std::thread::spawn(
-                    move || match fq_events::EventStore::open(&stats_path, &root) {
-                        Ok(store) => {
-                            if let Err(error) = store.prewarm_paths(&events_config) {
-                                eprintln!("paths index prewarm: {error}");
-                            }
-                        }
-                        Err(error) => eprintln!("paths index prewarm open: {error}"),
-                    },
-                );
-            }
-        }
         // Recorded LAST, so the identity every later statement is checked
         // against is the file the subsystems above just opened (or created).
         let state_store = state_store::StateStore::record(config)?;
@@ -236,7 +208,6 @@ impl Runtime {
             learned,
             accelerator,
             authz: RwLock::new(acl::AclState::embedded()),
-            events: std::sync::Mutex::new(None),
             state_store,
         })
     }
@@ -278,45 +249,21 @@ impl Runtime {
     }
 
     /// What already holds `name` in the relation namespace, if anything: a
-    /// source table or materialized view (both resolve as catalog tables), a
-    /// non-materialized view, or an event dataset. Every CREATE that introduces
-    /// a relation checks this first. One name standing for two relations is not
+    /// source table or materialized view (both resolve as catalog tables), or a
+    /// non-materialized view. Every CREATE that introduces a relation checks
+    /// this first. One name standing for two relations is not
     /// a cosmetic clash - a reference resolves to whichever kind the resolver
     /// reaches first (a view is expanded before a table is looked up), so the
     /// loser is silently read from the wrong relation.
-    pub(crate) fn relation_name_holder(
-        &self,
-        name: &str,
-    ) -> Result<Option<&'static str>, RuntimeError> {
+    pub(crate) fn relation_name_holder(&self, name: &str) -> Option<&'static str> {
         let catalog = self.catalog_snapshot();
         if catalog.resolve_table(None, None, name).is_some() {
-            return Ok(Some("a table or materialized view"));
+            return Some("a table or materialized view");
         }
         if catalog.get_view(name).is_some() {
-            return Ok(Some("a view"));
+            return Some("a view");
         }
-        if self.event_dataset_exists(name)? {
-            return Ok(Some("an event dataset"));
-        }
-        Ok(None)
-    }
-
-    /// Whether a live event dataset holds `name`, read straight from the
-    /// registry in the stats SQLite. A name check must not open the event store:
-    /// that would create the store's directory and its runtime as a side effect
-    /// of unrelated DDL. A config with no file path has no registry, so no
-    /// dataset can exist.
-    fn event_dataset_exists(&self, name: &str) -> Result<bool, RuntimeError> {
-        let config = self.config_snapshot();
-        let Some(stats_path) = stats_sqlite_path(&config) else {
-            return Ok(false);
-        };
-        let registry = fq_events::registry::Registry::open(&stats_path)
-            .map_err(fq_events::error::EventError::from)?;
-        let record = registry
-            .get_optional(name)
-            .map_err(fq_events::error::EventError::from)?;
-        Ok(record.is_some())
+        None
     }
 
     /// Run one SQL statement and return its Arrow result under the query's
@@ -408,17 +355,6 @@ impl Runtime {
             Statement::Revoke { object, grantee } => self.revoke(&object, &grantee),
             Statement::ShowUsers => self.show_users(),
             Statement::ShowGrants { grantee } => self.show_grants(grantee.as_deref()),
-            Statement::CreateEventDataset(def) => self.create_event_dataset(&def),
-            Statement::RefreshEventDataset { name } => self.refresh_event_dataset(&name),
-            Statement::RebuildEventDataset { name } => self.rebuild_event_dataset(&name),
-            Statement::CompactEventDataset { name } => self.compact_event_dataset(&name),
-            Statement::DropEventDataset { name } => self.drop_event_dataset(&name),
-            Statement::ShowEventDatasets => self.show_event_datasets(),
-            Statement::ShowEvents { dataset } => self.show_events(&dataset),
-            Statement::EventFunnel(spec) => self.run_event_funnel(&spec),
-            Statement::EventRetention(spec) => self.run_event_retention(&spec),
-            Statement::EventSegment(spec) => self.run_event_segment(&spec),
-            Statement::EventPaths(spec) => self.run_event_paths(&spec),
         }
     }
 
@@ -427,7 +363,6 @@ impl Runtime {
     fn execute_query(&self, sql: &str) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
         let (physical, substitutions) = self.plan_inner(sql, QueryPurpose::User)?;
         let visible_names = fq_plan::physical::visible_output_names(&physical);
-        self.ensure_event_analysis_ready(&physical)?;
         let execution = execute_plan(self.session, &physical)?;
         self.record_pushdown_fragments(&physical)?;
         // The learned-stats WRITE path: each measured (binding, rows) whose
@@ -461,24 +396,9 @@ impl Runtime {
         physical: &PhysicalPlan,
     ) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
         let visible_names = fq_plan::physical::visible_output_names(physical);
-        self.ensure_event_analysis_ready(physical)?;
         let execution = execute_plan(self.session, physical)?;
         self.persist_observations(&execution.measurements, &execution.observations)?;
         rename_result(&execution.schema, execution.batches, &visible_names)
-    }
-
-    /// If the plan runs an event analysis (`FROM paths(...)`), register this
-    /// session's event store with the execution data plane so the engine can run
-    /// the kernel against it. A plan without one registers nothing, so a runtime
-    /// with no config file (and thus no event store) is unaffected.
-    fn ensure_event_analysis_ready(&self, physical: &PhysicalPlan) -> Result<(), RuntimeError> {
-        if !plan_uses_event_analysis(physical) {
-            return Ok(());
-        }
-        let store = self.event_store()?;
-        let config = self.config_snapshot();
-        connectors::register_event_store(self.session, store, config.events.clone());
-        Ok(())
     }
 
     /// Advance each substituted view's benefit counters (`use_count`,
@@ -556,22 +476,6 @@ impl Runtime {
             }
             Statement::ShowUsers => return Ok(acl::users_describe_columns()),
             Statement::ShowGrants { .. } => return Ok(acl::grants_describe_columns()),
-            Statement::ShowEventDatasets => {
-                return Ok(events::show_event_datasets_columns());
-            }
-            Statement::ShowEvents { .. } => {
-                return Ok(vec![("event".to_owned(), DataType::Text)]);
-            }
-            Statement::EventFunnel(spec) => {
-                return Ok(events::funnel_describe_columns(&spec));
-            }
-            Statement::EventRetention(spec) => {
-                return Ok(events::retention_describe_columns(&spec));
-            }
-            Statement::EventSegment(spec) => {
-                return Ok(events::segment_describe_columns(&spec));
-            }
-            Statement::EventPaths(_) => return Ok(events::paths_describe_columns()),
             _ => return Ok(vec![("status".to_owned(), DataType::Text)]),
         }
         let physical = self.plan(sql)?;
@@ -673,11 +577,7 @@ impl Runtime {
         let ship_thresholds = ShipThresholds::from_config(&config.optimizer);
         let mut planner = PhysicalPlanner::new(Arc::clone(&catalog), Some(Rc::clone(&cost_model)))
             .with_ship_thresholds(ship_thresholds)
-            .with_single_source_pushdown(
-                config.optimizer.enable_single_source_pushdown
-                    || purpose == QueryPurpose::EventSource,
-            )
-            .with_streaming_source(purpose == QueryPurpose::EventSource);
+            .with_single_source_pushdown(config.optimizer.enable_single_source_pushdown);
         let physical = planner.plan(&substituted)?;
         // Referential closure, before anything executes: a node referencing a
         // qualified column no child produces would otherwise surface as an Arrow
@@ -782,18 +682,6 @@ pub(crate) fn stats_sqlite_path(config: &Config) -> Option<std::path::PathBuf> {
             .unwrap_or_else(|| std::path::Path::new("."))
             .join(stem + ".stats.sqlite"),
     )
-}
-
-/// Open the learned-stats catalog at the config's stats SQLite path, or
-/// `None` for a config with no source path.
-/// Whether any node in the physical plan is a table-valued event analysis
-/// (`FROM paths(...)`), so the runtime knows to wire the event store.
-fn plan_uses_event_analysis(plan: &PhysicalPlan) -> bool {
-    matches!(plan, PhysicalPlan::TableFunction(_))
-        || plan
-            .children()
-            .iter()
-            .any(|child| plan_uses_event_analysis(child))
 }
 
 /// Fetch every cataloged table's source statistics into the session cache, so
@@ -1502,5 +1390,3 @@ fn renamed_schema(schema: &SchemaRef, names: &[String]) -> SchemaRef {
     }
     Arc::new(Schema::new(fields))
 }
-
-mod source_stream;

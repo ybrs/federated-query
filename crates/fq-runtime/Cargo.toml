@@ -27,7 +27,6 @@ fq-exec = { path = "../fq-exec" }
 # Materialized-view store: the DDL surface (CREATE/REFRESH/DROP MATERIALIZED
 # VIEW) executes here and persists through fq-accel.
 fq-accel = { path = "../fq-accel" }
-fq-events = { path = "../fq-events" }
 # CREATE/ALTER USER hashes a plaintext password into a stored SCRAM verifier
 # server-side; the plaintext lives only for the call frame and is never stored.
 fq-scram = { path = "../fq-scram" }
@@ -52,7 +51,6 @@ parquet = "58"
 fq-scram = { path = "../fq-scram" }
 # The live-revoke test opens a second store handle to simulate a peer's write.
 fq-accel = { path = "../fq-accel" }
-fq-events = { path = "../fq-events" }
 
 [lints]
 workspace = true

@@ -1097,7 +1097,6 @@ fn plan_label(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::SingleRowGuard(_) => "SingleRowGuard",
         LogicalPlan::GroupedLimit(_) => "GroupedLimit",
         LogicalPlan::LateralJoin(_) => "LateralJoin",
-        LogicalPlan::TableFunction(_) => "TableFunction",
         LogicalPlan::Unnest(_) => "Unnest",
     }
 }

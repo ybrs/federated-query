@@ -80,13 +80,7 @@ benchmarks/perf_compare/results/
 benchmarks/perf_compare/fedq.so
 .claude/worktrees/
 fuzz/artifacts/
-event-analytics/fedq.events/
-event-analytics/fedq.mv/
-event-analytics/fedq.stats.sqlite*
-event-analytics/*.events/
 
-# The materialized event store of the repo-root config; runtime state, never tracked.
-event-analytics/
 
 # Per-machine agent settings: names this container's interpreter and PATH, which
 # is exactly the kind of absolute path the harnesses no longer hardcode.

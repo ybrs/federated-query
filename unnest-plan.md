@@ -3,9 +3,8 @@
 ## Purpose
 
 Query the Firebase Parquet export directly through fedq. Combine daily files
-with a persisted UNION ALL view, build one event dataset from its scalar role
-columns, and extract nested event properties using DataFusion's existing
-operators.
+with a persisted UNION ALL view and extract nested event properties using
+DataFusion's existing operators.
 
 ## Contracts
 
@@ -25,9 +24,6 @@ operators.
   rows. Ordinality records the position within the original list.
 - Reuse DataFusion's list expansion and struct access operators. Keep
   coordinator execution when a source cannot preserve these semantics.
-- Event datasets retain one row per original event. Parameter expansion is
-  composed with SQL extraction/aggregation before ingestion when properties
-  are promoted from event_params.
 
 ## Implementation sequence
 
@@ -43,7 +39,7 @@ operators.
    lengths, outer expansion, ordinality, views, unions, and invalid queries.
    Compare execution and result types with DuckDB.
 6. Use the actual export to create the combined view, inspect event names,
-   build an event dataset, and run paths, funnels, and retention.
+   and query nested properties.
 7. Run ./run_all_tests.sh in the active virtualenv and read its complete log.
    Update user-facing usage documentation with working examples.
 
@@ -56,9 +52,8 @@ lowers to DataFusion's native physical UNNEST operator.
 
 Direct execution registered all 111 daily files and created firebase_events.
 The view count and an independent DuckDB scan both returned 1,227,190 events
-and 22,744 actors. A second event dataset was built with the same counts. Paths, funnels,
-and retention returned results across separate CLI sessions. Nested CROSS JOIN
-and matching LEFT JOIN queries also returned results from the actual export.
+and 22,744 actors. Nested CROSS JOIN and matching LEFT JOIN queries also
+returned results from the actual export.
 
 The complete suite exposed parser, physical column naming, and ordered array
 aggregation defects. These are fixed and checked against DuckDB values and

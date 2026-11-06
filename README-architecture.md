@@ -5,8 +5,7 @@ The federated query engine executes SQL across heterogeneous data sources
 source and stitching the results together over Apache Arrow. It is a single
 Cargo workspace under `crates/`. This document describes how the crates fit
 together, the query pipeline, the statement surface beyond plain queries, the
-extension pattern the accelerator and event-analytics features follow, and the
-three front doors that expose the engine.
+materialized-view store, and the three front doors that expose the engine.
 
 All diagrams use plain ASCII. Arrows are written `->`.
 
@@ -40,8 +39,8 @@ authoritative statement):
 
 - fq-common - the leaf crate: configuration (`Config`, loaded from YAML with
   serde `deny_unknown_fields` so an unknown or renamed field cannot be silently
-  dropped), the error types, `DataType`, the planning budget, logging, and the
-  event-statement value types. No engine logic.
+  dropped), the error types, `DataType`, the planning budget, and logging.
+  No engine logic.
 - fq-plan - the node model: three enums, `Expr`, `LogicalPlan`, and
   `PhysicalPlan`, plus the shared expression-tree walkers. Every traversal is
   an exhaustive `match` with no `_` arm, so a new variant fails to compile every
@@ -60,8 +59,8 @@ authoritative statement):
 - fq-parse - SQL text to `LogicalPlan`. polyglot-sql is the parser; a
   `Converter` walks its AST into the logical model and rejects unsupported SQL
   loudly (never silently dropped). It also classifies the non-query statement
-  forms (materialized-view DDL, settings, event DDL and analyses) before the
-  query pipeline sees them.
+  forms (materialized-view DDL, settings, catalog and authorization DDL) before
+  the query pipeline sees them.
 - fq-bind - name resolution and typing: resolves every table and column
   reference against the catalog, sets each column's qualifier and `DataType`,
   and RAISES on an invalid reference (a bogus qualifier or a typo'd column
@@ -201,7 +200,7 @@ dispatched by `fq-runtime`:
   MATERIALIZED VIEWS`.
 - Settings: `SHOW SETTINGS`, `SHOW SETTING <name>`, `SET <name> = <value>`
   (or `SET <name> TO <value>`), `RESET <name>`, `RESET ALL`. The registry
-  holds 33 tunables across the optimizer, cost model, executor, exec data
+  holds tunables across the optimizer, cost model, executor, exec data
   plane, environment toggles, the accelerator, and the server. SET/RESET mutate
   the live session; a bad value or an unknown name raises, with a nearest-name
   suggestion.
@@ -235,52 +234,6 @@ cost) is rewritten to read the view. It is off-switchable per session
 (`accelerator.enable_substitution`, read fresh per query) and tracks per-view
 benefit counters.
 
-## The event store
-
-Event analytics (fq-events) is a second store beside the materialized views,
-for the four product-analytics questions: funnels, retention, segmentation and
-paths. `CREATE EVENT DATASET <name> FROM <source table> ACTOR <c> TIME <c>
-EVENT <c> [TIEBREAK <c>] [PROPERTIES (...)] [WITH (...)]` reads a source table
-once and materializes it into an actor-partitioned columnar store under
-`<config>.events/`, registered in the same SQLite beside the learned stats.
-`FUNNEL`, `RETENTION`, `SEGMENT` and `PATHS` are statements over that store,
-each also usable as a table function in `FROM`; `REFRESH`, `REBUILD`, `DROP`
-and `SHOW EVENT DATASETS` complete the surface. There is no ATTACH, LOAD or
-WARM: a dataset is opened lazily on first use.
-
-Each dataset creation reserves a persistent SQLite AUTOINCREMENT identity for
-its storage directory. DROP removes the dataset's files but does not reset that
-sequence. A same-name CREATE therefore writes to new paths, preserving the
-decoded-block cache's assumption that a file path always denotes the same
-contents. The per-name build lock remains stable across creations.
-
-Two properties of the store decide how it behaves in practice, and both are
-measured rather than assumed (numbers from an idle 12-core box, 2026-08-09):
-
-- A BUILD IS ONE NUMBER, and about 40% of it is the paths index. 20,688,550
-  events build in 8.7 s (index 3.5 s); 100,258,738 events in 41.2 s (index
-  17.2 s). The index is a suffix array with an LCP array over every actor's
-  duplicate-collapsed event stream, plus a second pair over the reversed text,
-  which is what lets a PATHS statement answer at ANY depth from one interval
-  sweep - depth changes neither the index's size nor the sweep's cost.
-  Construction is linear (vendored libsais): 2.3 s at 20.1M positions, 11.3 s
-  at 97.6M.
-
-- REFRESH IS NOT INCREMENTAL, despite pulling only the delta. The source read
-  is `WHERE <refresh_key> > <watermark>` and new generation files are appended
-  rather than existing shards rewritten, but the paths index is then rebuilt
-  over every event. Appending 1,000 rows to a 40M-event dataset costs 11.0 s -
-  more than building the first 20M from scratch. Generations also never
-  compact (`events.max_generations` is a setting nothing reads), and two
-  generations already cost 3x on funnel and retention against one.
-
-Without the index PATHS falls back to scanning the store, which is a slowdown
-and not a different answer: on 100M events an anchored PATHS is 0.5 s against
-0.013 s indexed, and both paths return byte-identical rows.
-
-`event-analytics-design.md` section 6.2a carries the full measurement table and
-the shapes a fix could take; taskq holds the open work.
-
 ## Front doors
 
 Three binaries expose one `fq_runtime::Runtime`; all engine logic lives in the
@@ -305,10 +258,6 @@ runtime and the crates below it.
 
 ## Deeper docs
 
-- `event-analytics-design.md` - the event store's design: storage format,
-  identity and dictionaries, indexes, the build pipeline, refresh mechanics
-  (section 6.2a is the measured cost of refresh and the paths index), and the
-  query algorithms behind the four analyses.
 - `accelerator-plan.md` - the materialized-view / fragment-cache design: chunk
   model, keying, invalidation, the refresh mechanics, substitution, and the
   phased roadmap (S3 backend and benefit-based eviction are Phase D).

@@ -330,7 +330,6 @@ fn node_kind(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::SingleRowGuard(_) => "SingleRowGuard",
         LogicalPlan::GroupedLimit(_) => "GroupedLimit",
         LogicalPlan::LateralJoin(_) => "LateralJoin",
-        LogicalPlan::TableFunction(_) => "TableFunction",
         LogicalPlan::Unnest(_) => "Unnest",
     }
 }
@@ -540,7 +539,6 @@ mod tests {
             server: ServerConfig::default(),
             accelerator: fq_common::AcceleratorConfig::default(),
             catalog: fq_common::CatalogConfig::default(),
-            events: fq_common::EventsConfig::default(),
             diagnostics: fq_common::DiagnosticsConfig::default(),
             source_path: None,
         }

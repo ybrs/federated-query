@@ -89,7 +89,7 @@ impl Runtime {
     ) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
         let accel = self.accelerator()?;
         let catalog = self.catalog_snapshot();
-        if let Some(holder) = self.relation_name_holder(name)? {
+        if let Some(holder) = self.relation_name_holder(name) {
             return Err(RuntimeError::MaterializedView(format!(
                 "relation '{name}' already exists ({holder})"
             )));

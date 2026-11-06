@@ -76,9 +76,8 @@ and cannot be dropped with SQL.
 
 The supported source kinds are postgres, postgresql, duckdb, clickhouse,
 mysql, and parquet. Connection parameters are validated for the selected
-source kind. See the event analytics tutorial for complete PostgreSQL and
-Parquet examples:
-doc/event-analytics-tutorial.md.
+source kind. See [the configuration example](config/example_config.yaml)
+for PostgreSQL and DuckDB connection parameters.
 
 A `parquet` source declares exactly one shape: `dir` (one table per file),
 `file` (one file, one table named after the datasource), `glob` (one table over
@@ -90,7 +89,7 @@ and statistics are folded once. The file set is fixed at registration, so a
 newly added matching file is picked up by re-registering the source; a replaced
 listed file's contents are seen on the next query.
 
-For daily Firebase exports, nested fields, UNNEST, and event analyses, see
+For daily Firebase exports, nested fields, and UNNEST, see
 [Firebase Parquet CLI workflow](doc/firebase-parquet.md).
 
 ## Query features
@@ -102,7 +101,6 @@ For daily Firebase exports, nested fields, UNNEST, and event analyses, see
   reductions.
 - Correlated subquery decorrelation with NULL-aware semantics.
 - Materialized views with explicit refresh and query substitution.
-- Event datasets with funnel, retention, segmentation, and path analyses.
 - Nested Parquet schemas, struct field access, and list expansion with UNNEST.
 - Multi-file Parquet tables by glob, explicit file list, or manifest.
 - EXPLAIN, catalog inspection, and runtime settings.
@@ -116,17 +114,6 @@ SELECT o.id, c.name, o.amount
 FROM postgres_prod.public.orders AS o
 JOIN local_duckdb.main.customers AS c ON o.customer_id = c.id
 WHERE o.amount > 1000;
-~~~
-
-For event analytics, start with:
-
-~~~sql
-CREATE EVENT DATASET web FROM events.main.events
-  ACTOR user_id TIME ts EVENT event_name
-  PROPERTIES (device, country);
-
-FUNNEL ('page_view', 'view_item', 'add_to_cart')
-  ON web WINDOW 7 DAY;
 ~~~
 
 ## CLI
@@ -197,8 +184,8 @@ SQL text
 ~~~
 
 fq-runtime orchestrates the pipeline and owns statement dispatch, the live
-catalog, persisted dynamic sources, materialized views, event datasets,
-settings, and planning-budget enforcement. The connectors separate source
+catalog, persisted dynamic sources, materialized views, settings, and
+planning-budget enforcement. The connectors separate source
 metadata and statistics from the execution data plane.
 
 See README-architecture.md for crate boundaries, expression semantics,
@@ -214,7 +201,6 @@ crates/fq-optimize/       Logical optimization and cost estimation
 crates/fq-physical/       Physical planning and pushdown
 crates/fq-exec/           Federated execution
 crates/fq-runtime/        Runtime orchestration and statement dispatch
-crates/fq-events/         Event dataset storage and analytics
 crates/fq-accel/          Materialized-view storage
 crates/fedq-server/       PostgreSQL wire-protocol server
 crates/fedq/              CLI
@@ -256,26 +242,14 @@ MIT License
 - "Unnesting Arbitrary Queries" (Neumann & Kemper, 2015)
 -
 
-### Native Parquet ingestion
+### Native Parquet manifests
 
 `config/native-parquet.example.yaml` mounts one logical table over an explicit
 manifest of the existing Parquet files. The manifest contains one path per line;
 relative entries resolve against the manifest's directory. Capture the selected
-source files before building. Missing, duplicate, or incompatible files raise.
+source files before registering the source. Missing, duplicate, or incompatible
+files raise.
 
-`examples/native-parquet-ingestion.sql` builds the event dataset directly from
-that table. It decodes JSON-encoded event names, uses
-`COALESCE(user_id, device_id)` for the actor, and declares
-`TIEBREAK (event_id, uuid)`: the builder orders equal timestamps by the source
-counter, then UUID, inside its shard sort and stamps each row's rank as the
-persisted tiebreak. UUID supplies a repeatable fallback when the source counter
-collides; it does not establish real-world chronology. The complete ordering key
-must distinguish events that need distinct ordering. This ordering can change
-paths and ordered funnels from a UUID-hash-based build.
-
-The native Parquet reader streams event dataset builds and rebuilds when their
-SELECT executes as one native source query. JSON extraction runs in the same
-native function on Parquet and on the
-coordinator. Malformed JSON, invalid paths, and source read errors raise; failed
-builds do not register a partially built dataset. The event dataset remains a
-derived store; mounting Parquet does not eliminate those output files.
+Query the mounted table with ordinary SQL. JSON string extraction with
+`json_extract_string` works on Parquet and on the coordinator; malformed JSON,
+invalid paths, and source read errors raise.

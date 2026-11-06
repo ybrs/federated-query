@@ -35,13 +35,13 @@ impl Runtime {
         let catalog = self.catalog_snapshot();
         let exists = catalog.get_view(name).is_some();
         if exists && !or_replace {
-            return Err(RuntimeError::EventStatement(format!(
+            return Err(RuntimeError::View(format!(
                 "view '{name}' already exists; use CREATE OR REPLACE VIEW to redefine it"
             )));
         }
         if !exists {
-            if let Some(holder) = self.relation_name_holder(name)? {
-                return Err(RuntimeError::EventStatement(format!(
+            if let Some(holder) = self.relation_name_holder(name) {
+                return Err(RuntimeError::View(format!(
                     "relation '{name}' already exists ({holder}); a view cannot shadow it"
                 )));
             }
@@ -91,7 +91,7 @@ impl Runtime {
         if let Some(renames) = column_aliases {
             let produced = bound.schema().len();
             if renames.len() != produced {
-                return Err(RuntimeError::EventStatement(format!(
+                return Err(RuntimeError::View(format!(
                     "view '{name}' declares {} column names but its query produces {produced}",
                     renames.len()
                 )));
@@ -108,9 +108,7 @@ impl Runtime {
     ) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
         let accel = self.accelerator()?;
         if !accel.delete_view(name)? {
-            return Err(RuntimeError::EventStatement(format!(
-                "view '{name}' does not exist"
-            )));
+            return Err(RuntimeError::View(format!("view '{name}' does not exist")));
         }
         let mut next = (*self.catalog_snapshot()).clone();
         next.remove_view(name);

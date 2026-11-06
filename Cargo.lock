@@ -2021,27 +2021,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "fq-events"
-version = "0.1.0"
-dependencies = [
- "arrow",
- "bytes",
- "cc",
- "chrono",
- "fq-common",
- "futures",
- "lz4_flex",
- "object_store",
- "rusqlite",
- "serde",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "xxhash-rust",
- "zstd",
-]
-
-[[package]]
 name = "fq-exec"
 version = "0.1.0"
 dependencies = [
@@ -2058,7 +2037,6 @@ dependencies = [
  "fq-common",
  "fq-connectors",
  "fq-decorrelate",
- "fq-events",
  "fq-optimize",
  "fq-parse",
  "fq-physical",
@@ -2149,7 +2127,6 @@ dependencies = [
  "fq-connectors",
  "fq-decorrelate",
  "fq-emit",
- "fq-events",
  "fq-exec",
  "fq-optimize",
  "fq-parse",
@@ -5462,12 +5439,6 @@ dependencies = [
  "libc",
  "rustix 1.1.4",
 ]
-
-[[package]]
-name = "xxhash-rust"
-version = "0.8.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aee1b19627c7c60102ab80d3a9cbe18de90bfe03bfa6c3715447681f0e8c8af6"
 
 [[package]]
 name = "yoke"

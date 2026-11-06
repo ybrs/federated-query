@@ -22,13 +22,13 @@ pub use expr::{
     BinaryOpType, ColumnRef, Expr, LiteralValue, NullsOrder, Quantifier, UnaryOpType,
 };
 pub use logical::{
-    Aggregate, AggregateFunction, AnalysisCall, Cte, CteRef, Explain, ExplainFormat, Filter,
-    GroupedLimit, Join, JoinType, LateralJoin, Limit, LogicalPlan, Projection, Scan, SetOpKind,
-    SetOperation, SingleRowGuard, Sort, SubqueryScan, TableFunction, Union, Unnest, Values,
+    Aggregate, AggregateFunction, Cte, CteRef, Explain, ExplainFormat, Filter, GroupedLimit, Join,
+    JoinType, LateralJoin, Limit, LogicalPlan, Projection, Scan, SetOpKind, SetOperation,
+    SingleRowGuard, Sort, SubqueryScan, Union, Unnest, Values,
 };
 pub use physical::{
     output_column_names, physical_column_name, BuildSide, ColumnAliasMap, DatasourceKind,
-    GroupObservation, PhysicalPlan, PhysicalRemoteQuery, PhysicalTableFunction, SeededSchema,
+    GroupObservation, PhysicalPlan, PhysicalRemoteQuery, SeededSchema,
 };
 
 mod json;

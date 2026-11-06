@@ -177,8 +177,8 @@ serialize the same way, mirroring their in-memory shape one-to-one, so a
 persisted row round-trips into a `DataSourceConfig` with no field re-listing.
 
 VERSIONING: an open-time `PRAGMA table_info('dynamic_datasources')` migration
-adds any absent column with a default, exactly like `add_benefit_columns` and
-the event-view tiebreak migration. `synchronous` stays ON for this table (it is
+adds any absent column with a default, exactly like `add_benefit_columns`.
+`synchronous` stays ON for this table (it is
 durable operator state, unlike the `synchronous=OFF` learned stats). The
 open-time busy-retry (`with_busy_retry`) already covers the WAL/DDL contention
 of concurrent first opens.
@@ -351,8 +351,8 @@ only the STORAGE shape so the column is future-proof today.
   simple. `source_identity`'s existing repoint-fingerprint would ALSO catch a
   changed source, but purge-on-drop is the clean primary mechanism.
 - MATERIALIZED VIEWS referencing the source. `DROP DATASOURCE` scans the
-  persisted view definitions (`materialized_views.definition_sql`, the event-view
-  registry) for a base table in the datasource and RAISES naming the dependent
+  persisted view definitions in the materialized-view and stored-view registries
+  for a base table in the datasource and RAISES naming the dependent
   view(s) rather than orphaning a view whose next refresh would fail to bind.
   This is the dependency guard that replaces CASCADE (section 1).
 - CATALOG-METADATA CACHE. The `StatisticsCollector` caches source stats and
@@ -377,8 +377,8 @@ today; that identity is itself a gate.
   its open-time migration; bootstrap merge with the raise-on-collision policy;
   connect-and-metadata-validate before persist with the connect timeout;
   per-session visibility + new-session pickup; the unavailable-source
-  (bind-time raise) path; purge-on-drop of learned rows; the MV/event-view
-  dependency guard; fail-closed credential redaction; plaintext credential
+  (bind-time raise) path; purge-on-drop of learned rows; dependency guards for
+  materialized and stored views; fail-closed credential redaction; plaintext credential
   storage.
   Test strategy: statement-classification unit tests (every form parses, every
   rejected option - IF NOT EXISTS, OR REPLACE, ALTER, IF EXISTS, CASCADE,

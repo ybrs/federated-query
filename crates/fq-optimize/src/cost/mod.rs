@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use fq_common::CostConfig;
 use fq_plan::expr::{ColumnRef, Expr};
-use fq_plan::logical::{AnalysisCall, Cte, LogicalPlan, Scan, SetOpKind, TableFunction};
+use fq_plan::logical::{Cte, LogicalPlan, Scan, SetOpKind};
 
 use crate::error::{EstimateError, Result};
 use crate::estimate_defaults::{add_rows, combine_defaults, min_rows, CardinalityEstimate};
@@ -103,7 +103,6 @@ impl CostModel {
                     &["lateral_multiplicity".to_string()],
                 )))
             }
-            LogicalPlan::TableFunction(node) => Ok(estimate_table_function(node)),
             LogicalPlan::Unnest(node) => {
                 let input = self.estimate(&node.input)?;
                 Ok(CardinalityEstimate::unknown(combine_defaults(
@@ -370,27 +369,6 @@ fn key_name(key: &Expr) -> String {
 /// negative count (a source contract violation) reads as UNKNOWN.
 fn ndv_u64(value: Option<i64>) -> Option<u64> {
     value.and_then(|number| u64::try_from(number).ok())
-}
-
-/// A cardinality estimate for a table-valued analysis. Some analyses are bounded
-/// by metadata alone (PATHS by top*depth; a no-breakdown FUNNEL is exactly one
-/// row per step), so they estimate KNOWN; the rest depend on cohort/bucket counts
-/// and breakdown cardinality that only data reveals, so they estimate UNKNOWN
-/// rather than invent a number.
-fn estimate_table_function(node: &TableFunction) -> CardinalityEstimate {
-    match &node.call {
-        AnalysisCall::Paths(spec) => CardinalityEstimate::known(
-            u64::from(spec.top).saturating_mul(u64::from(spec.depth)),
-            vec!["table_function_output_bound".to_string()],
-        ),
-        AnalysisCall::Funnel(spec) if spec.breakdown.is_none() => CardinalityEstimate::known(
-            spec.steps.len() as u64,
-            vec!["table_function_output_bound".to_string()],
-        ),
-        AnalysisCall::Funnel(_) | AnalysisCall::Retention(_) | AnalysisCall::Segment(_) => {
-            CardinalityEstimate::unknown(vec!["table_function_output_unbounded".to_string()])
-        }
-    }
 }
 
 #[cfg(test)]

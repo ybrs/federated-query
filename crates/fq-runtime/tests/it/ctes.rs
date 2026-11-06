@@ -102,7 +102,6 @@ fn two_source_runtime(tag: &str) -> (Runtime, String, String) {
         server: ServerConfig::default(),
         accelerator: fq_common::AcceleratorConfig::default(),
         catalog: fq_common::CatalogConfig::default(),
-        events: fq_common::EventsConfig::default(),
         diagnostics: fq_common::DiagnosticsConfig::default(),
         source_path: None,
     };
@@ -475,7 +474,6 @@ fn two_source_runtime_seeded(
         server: ServerConfig::default(),
         accelerator: fq_common::AcceleratorConfig::default(),
         catalog: fq_common::CatalogConfig::default(),
-        events: fq_common::EventsConfig::default(),
         diagnostics: fq_common::DiagnosticsConfig::default(),
         source_path: None,
     };

@@ -7,7 +7,7 @@
 
 use std::collections::BTreeMap;
 
-use fq_plan::{AnalysisCall, Expr};
+use fq_plan::Expr;
 
 /// One orchestration step the engine runs in order. (ir.rs `Step`, no `op` tag.)
 #[derive(Debug, Clone)]
@@ -50,11 +50,6 @@ pub enum Step {
         inputs: BTreeMap<String, String>,
         binding: String,
     },
-    /// Run an event-analytics analysis (e.g. `paths(...)`) into an in-memory
-    /// relation: the engine executes the fq-events kernel against the session's
-    /// event store and binds the resulting Arrow batches. `binding` names the
-    /// produced relation.
-    EventAnalysis { call: AnalysisCall, binding: String },
     /// The final result binding.
     Return { input: String },
 }
@@ -66,8 +61,7 @@ impl Step {
             Step::SourceScan { binding, .. }
             | Step::CollectDistinct { binding, .. }
             | Step::InjectedScan { binding, .. }
-            | Step::Merge { binding, .. }
-            | Step::EventAnalysis { binding, .. } => Some(binding),
+            | Step::Merge { binding, .. } => Some(binding),
             Step::Ship { .. } | Step::Return { .. } => None,
         }
     }

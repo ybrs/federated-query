@@ -71,7 +71,7 @@ pub enum RuntimeError {
     /// The SQLite file this runtime keeps its engine state in vanished, was
     /// replaced, or stopped being a database while the runtime held it open.
     /// The learned statistics, persisted settings, registered datasources,
-    /// materialized views, users and event datasets it carried all steer plan
+    /// materialized views and users it carried all steer plan
     /// choice and access, so their loss puts the runtime in an unknown state:
     /// it is poisoned and every later call returns this same error. Every other
     /// variant describes ONE failed statement; this one says the runtime is
@@ -104,6 +104,10 @@ pub enum RuntimeError {
     #[error("materialized view error: {0}")]
     MaterializedView(String),
 
+    /// A view definition, name collision, or missing view rejected by view DDL.
+    #[error("view error: {0}")]
+    View(String),
+
     /// A settings statement (SHOW SETTING / SET / RESET) the runtime rejects: an
     /// unknown setting name, a SET on a static setting, or a value that does not
     /// parse into the setting's type. Every invalid settings statement raises.
@@ -122,15 +126,4 @@ pub enum RuntimeError {
     /// or a malformed stored verifier. Every invalid ACL statement raises.
     #[error("acl error: {0}")]
     Acl(String),
-
-    /// An event-analytics failure from the fq-events store or executors: the
-    /// typed component error propagates unwrapped.
-    #[error("event analytics error: {0}")]
-    Events(#[from] fq_events::error::EventError),
-
-    /// An event statement the runtime itself rejects before the store is
-    /// involved: a name collision, a missing source table/column, a config
-    /// with no file path, or a refresh key that cannot be tracked.
-    #[error("event statement error: {0}")]
-    EventStatement(String),
 }

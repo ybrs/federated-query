@@ -72,7 +72,7 @@ environment before running project commands. `make install` installs
 # BUILD TIME IS ONE NUMBER
 
 A build time is the wall clock from the statement being issued to the
-statement returning, everything included. For materialized views, or "create event dataset"
+statement returning, everything included. For materialized views,
 the build time starts from when the statement is issued. There is no base build or some other bullshit. There is only one build time. 
 
 # EXPRESSION SEMANTICS ARE DUCKDB'S

@@ -37,8 +37,7 @@ use tokio::runtime::Runtime;
 use crate::connectors;
 use crate::core::expr::{literal_from_array, to_df_expr};
 use crate::core::ir::{
-    AggCall, AggSelectItem, EventAnalysisSpec, Fragment, Ir, IrExpr, JoinKind, Projection,
-    ScanSpec, Step,
+    AggCall, AggSelectItem, Fragment, Ir, IrExpr, JoinKind, Projection, ScanSpec, Step,
 };
 use crate::core::sql::{base_filter_sql, render_expr, scan_sql, select_list_sql, temp_join_sql};
 use crate::core::types::DsKind;
@@ -525,9 +524,6 @@ fn log_step(step: &Step, ir: &Ir, bindings: &HashMap<String, Binding>, elapsed_m
         } => {
             format!("ship          ds={datasource:<6} table={table}")
         }
-        Step::EventAnalysis { binding, .. } => {
-            format!("event_anlys   rows={}", binding_rows(bindings, binding))
-        }
         Step::Return { .. } => "return".to_string(),
     };
     eprintln!("[fedqrs] {elapsed_ms:9.2}ms  {line}");
@@ -690,11 +686,6 @@ pub fn execute(ir: &Ir) -> ExecResult<(SchemaRef, Vec<RecordBatch>, Vec<(String,
                 }
             }
 
-            Step::EventAnalysis { analysis, binding } => {
-                let batches = run_event_analysis(analysis)?;
-                store_relation(&mut bindings, binding, batches).map_err(df_to_exec)?;
-            }
-
             Step::Return { input } => {
                 runtime
                     .block_on(force_materialized(&mut bindings, input))
@@ -725,53 +716,7 @@ fn observable_binding(step: &Step) -> Option<&String> {
         Step::SourceScan { binding, .. } => Some(binding),
         Step::InjectedScan { binding, .. } => Some(binding),
         Step::CollectDistinct { binding, .. } => Some(binding),
-        Step::EventAnalysis { binding, .. } => Some(binding),
         _ => None,
-    }
-}
-
-/// Run an event-analytics analysis into Arrow batches against the current
-/// session's registered event store. A missing dataset or an out-of-bounds spec
-/// raises (the fq-events kernel's own guards), so the relation is never wrong or
-/// silently empty.
-fn run_event_analysis(analysis: &EventAnalysisSpec) -> ExecResult<Batches> {
-    let (store, config) = connectors::event_store(connectors::current_session())?;
-    let dataset = store
-        .dataset(analysis_dataset(analysis))
-        .map_err(|error| ExecError::runtime(error.to_string()))?;
-    let to_exec = |error: fq_events::error::EventError| ExecError::runtime(error.to_string());
-    let (schema, batches) = match analysis {
-        EventAnalysisSpec::Paths(spec) => {
-            let result =
-                fq_events::run_paths(store.io(), &dataset, spec, &config).map_err(to_exec)?;
-            fq_events::paths_to_batches(&result)
-        }
-        EventAnalysisSpec::Funnel(spec) => {
-            let result =
-                fq_events::run_funnel(store.io(), &dataset, spec, &config).map_err(to_exec)?;
-            fq_events::funnel_to_batches(&result)
-        }
-        EventAnalysisSpec::Retention(spec) => {
-            let result =
-                fq_events::run_retention(store.io(), &dataset, spec, &config).map_err(to_exec)?;
-            fq_events::retention_to_batches(&result)
-        }
-        EventAnalysisSpec::Segment(spec) => {
-            let result =
-                fq_events::run_segment(store.io(), &dataset, spec, &config).map_err(to_exec)?;
-            fq_events::segment_to_batches(&result)
-        }
-    };
-    Ok(Batches { schema, batches })
-}
-
-/// The dataset name an analysis reads.
-fn analysis_dataset(analysis: &EventAnalysisSpec) -> &str {
-    match analysis {
-        EventAnalysisSpec::Paths(spec) => &spec.dataset,
-        EventAnalysisSpec::Funnel(spec) => &spec.dataset,
-        EventAnalysisSpec::Retention(spec) => &spec.dataset,
-        EventAnalysisSpec::Segment(spec) => &spec.dataset,
     }
 }
 
@@ -786,7 +731,6 @@ fn binding_use_counts(ir: &Ir) -> HashMap<String, usize> {
     for step in &ir.steps {
         match step {
             Step::SourceScan { .. } => {}
-            Step::EventAnalysis { .. } => {}
             Step::Ship { input, .. } => bump(input),
             Step::CollectDistinct { input, .. } => bump(input),
             Step::InjectedScan {

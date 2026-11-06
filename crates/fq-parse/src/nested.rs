@@ -218,7 +218,6 @@ fn has_relation(plan: &LogicalPlan, name: &str) -> bool {
         LogicalPlan::SubqueryScan(node) => &node.alias,
         LogicalPlan::Unnest(node) => &node.alias,
         LogicalPlan::CteRef(node) => node.alias.as_deref().unwrap_or(&node.name),
-        LogicalPlan::TableFunction(node) => &node.alias,
         _ => "",
     };
     local.eq_ignore_ascii_case(name)

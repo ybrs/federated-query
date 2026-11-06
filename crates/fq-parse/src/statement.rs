@@ -36,12 +36,8 @@
 use crate::error::ParseError;
 
 /// One SQL statement, classified: a materialized-view DDL form, a settings
-/// statement, an event-analytics statement, or a plain query passed through as
-/// text for the normal parse pipeline.
-///
-/// The event family reserves the leading keywords `FUNNEL`, `RETENTION`,
-/// `SEGMENT`, `PATHS`, and `REBUILD` for its analysis and DDL forms; none of
-/// them starts a plannable SQL query, so classification is unambiguous.
+/// statement, catalog or authorization DDL, or a plain query passed through
+/// as text for the normal parse pipeline.
 #[derive(Debug, PartialEq)]
 pub enum Statement<'a> {
     /// Anything that is not a recognized statement form; the full original text.
@@ -135,30 +131,6 @@ pub enum Statement<'a> {
     ShowUsers,
     /// `SHOW GRANTS [FOR <grantee>]`.
     ShowGrants { grantee: Option<String> },
-    /// `CREATE EVENT DATASET <name> FROM ... ACTOR ... TIME ... EVENT ...`.
-    CreateEventDataset(fq_common::events::EventDatasetDef),
-    /// `REFRESH EVENT DATASET <name>`: incremental append past the watermark.
-    RefreshEventDataset { name: String },
-    /// `REBUILD EVENT DATASET <name>`: full re-ingest from the source.
-    RebuildEventDataset { name: String },
-    /// `COMPACT EVENT DATASET <name>`: fold the paths-index segments into
-    /// one base, online.
-    CompactEventDataset { name: String },
-    /// `DROP EVENT DATASET <name>`.
-    DropEventDataset { name: String },
-    /// `SHOW EVENT DATASETS`: list every event dataset with its build state.
-    ShowEventDatasets,
-    /// `SHOW EVENTS FROM <dataset>`: the distinct event names of one dataset,
-    /// read from its dictionary (no data scan).
-    ShowEvents { dataset: String },
-    /// `FUNNEL ( <event>, ... ) ON <dataset> WINDOW <interval> ...`.
-    EventFunnel(fq_common::events::FunnelSpec),
-    /// `RETENTION ON <dataset> BIRTH ... RETURN ... PERIOD ...`.
-    EventRetention(fq_common::events::RetentionSpec),
-    /// `SEGMENT <measure> ON <dataset> BUCKET <grain> ...`.
-    EventSegment(fq_common::events::SegmentSpec),
-    /// `PATHS ON <dataset> [STARTING AT ... | ENDING AT ...] ...`.
-    EventPaths(fq_common::events::PathsSpec),
 }
 
 /// The object a GRANT/REVOKE names, at one of three containment levels. A grant
@@ -212,24 +184,7 @@ pub fn classify_statement(sql: &str) -> Result<Statement<'_>, ParseError> {
         return Ok(Statement::Query(sql));
     };
     match first.to_ascii_uppercase().as_str() {
-        // REFRESH exists only for the materialized-view and event-dataset
-        // forms; the second word picks the family.
-        "REFRESH" if second_word_is(sql, "EVENT") => {
-            crate::events::classify_refresh_event(&mut tokens)
-        }
         "REFRESH" => classify_refresh(&mut tokens),
-        "REBUILD" => crate::events::classify_rebuild_event(&mut tokens),
-        "COMPACT" => crate::events::classify_compact_event(&mut tokens),
-        "CREATE" if second_word_is(sql, "EVENT") => {
-            crate::events::classify_create_event(&mut tokens)
-        }
-        "DROP" if second_word_is(sql, "EVENT") => crate::events::classify_drop_event(&mut tokens),
-        "SHOW" if second_word_is(sql, "EVENT") => crate::events::classify_show_event(&mut tokens),
-        "SHOW" if second_word_is(sql, "EVENTS") => crate::events::classify_show_events(&mut tokens),
-        "FUNNEL" => crate::events::classify_funnel(&mut tokens),
-        "RETENTION" => crate::events::classify_retention(&mut tokens),
-        "SEGMENT" => crate::events::classify_segment(&mut tokens),
-        "PATHS" => crate::events::classify_paths(&mut tokens),
         "CREATE" if second_word_is(sql, "MATERIALIZED") => classify_create(&mut tokens),
         "CREATE" if second_word_is(sql, "VIEW") => classify_create_view(&mut tokens, false),
         // `CREATE OR REPLACE VIEW` has `OR` as its second word, so it does not
@@ -1300,42 +1255,6 @@ impl<'a> Tokenizer<'a> {
         }
     }
 
-    /// Consume a balanced `( ... )` group and return the text between the
-    /// outer parentheses (quote-aware; nested parentheses stay balanced). The
-    /// opening parenthesis must be the next token; a statement ending before
-    /// the matching close raises.
-    pub(crate) fn take_parenthesized(&mut self, form: &str) -> Result<&'a str, ParseError> {
-        match self.next_token() {
-            Some(Token::Other('(')) => {}
-            other => {
-                return Err(ParseError::Parse(format!(
-                    "expected '(' in {form}, found '{}'",
-                    describe_opt(other.as_ref())
-                )))
-            }
-        }
-        let start = self.pos;
-        let mut depth = 1usize;
-        loop {
-            let before = self.pos;
-            match self.next_token() {
-                Some(Token::Other('(')) => depth += 1,
-                Some(Token::Other(')')) => {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Ok(&self.input[start..before]);
-                    }
-                }
-                Some(_) => {}
-                None => {
-                    return Err(ParseError::Parse(format!(
-                        "{form} has an unclosed '(' before end of statement"
-                    )))
-                }
-            }
-        }
-    }
-
     /// Read a bare word starting at the current position.
     fn read_word(&mut self) -> Token<'a> {
         let start = self.pos;
@@ -1883,10 +1802,10 @@ mod tests {
     #[test]
     fn set_strips_the_statement_terminator_from_the_value() {
         assert_eq!(
-            classify("SET events.build_memory_bytes = 17179869184;"),
+            classify("SET executor.max_memory_mb = 4096;"),
             Statement::SetSetting {
-                name: "events.build_memory_bytes".to_string(),
-                value: "17179869184".to_string(),
+                name: "executor.max_memory_mb".to_string(),
+                value: "4096".to_string(),
             }
         );
         // A quoted value keeps a ';' INSIDE the quotes.

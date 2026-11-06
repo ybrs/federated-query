@@ -1,7 +1,5 @@
-# The build context for docker/engine.Dockerfile (the fedq-server image the
-# game-analytics demo runs) is this repository root. Almost nothing here
-# belongs in that context: target/ alone is tens of gigabytes, and vendor/
-# holds a 179 MB generated parquet that must never enter an image.
+# Engine image builds use this repository root as their context. Build output
+# and vendored data stay outside the context.
 #
 # The rule is therefore inverted - everything is excluded, and the few trees
 # the engine build reads are named back in. A directory added later is outside

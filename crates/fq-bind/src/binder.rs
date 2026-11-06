@@ -25,7 +25,7 @@ use fq_common::update;
 use fq_plan::expr::ColumnRef;
 use fq_plan::{
     Aggregate, Cte, CteRef, Explain, Expr, Filter, Join, LateralJoin, Limit, LogicalPlan,
-    Projection, Scan, SetOperation, Sort, SubqueryScan, TableFunction, Values,
+    Projection, Scan, SetOperation, Sort, SubqueryScan, Values,
 };
 
 use crate::error::BindError;
@@ -111,13 +111,6 @@ impl<'a> Binder<'a> {
             LogicalPlan::CteRef(node) => self.bind_cte_ref(node),
             LogicalPlan::Values(node) => self.bind_values(node),
             LogicalPlan::Unnest(node) => self.bind_unnest(node),
-            // A table-valued analysis call binds as a pass-through: its parameters
-            // are baked into the spec (no coordinator expressions to resolve) and
-            // its output schema is fixed by the analysis kind, so the surfaced
-            // columns become resolvable to outer nodes through `collect_scope`/
-            // `plan_output_columns`. The dataset lives in the event store, not the
-            // catalog, so a missing dataset raises at execution, not here.
-            LogicalPlan::TableFunction(node) => Ok(LogicalPlan::TableFunction(node)),
             LogicalPlan::Explain(node) => self.bind_explain(node),
             other => Err(BindError::Unsupported(format!(
                 "plan node {}",
@@ -647,7 +640,6 @@ impl<'a> Binder<'a> {
                 Ok(columns)
             }
             LogicalPlan::CteRef(node) => self.cte_ref_columns(node),
-            LogicalPlan::TableFunction(node) => Ok(table_function_columns(node)),
             LogicalPlan::Unnest(node) => {
                 let mut columns = if node.retain_input {
                     self.plan_output_columns(&node.input)?
@@ -748,13 +740,6 @@ impl<'a> Binder<'a> {
                     .ok_or_else(|| BindError::TableNotFound(format!("CTE {}", node.name)))?;
                 let alias = node.alias.clone().unwrap_or_else(|| node.name.clone());
                 scope.push((alias, table.clone()));
-                Ok(())
-            }
-            LogicalPlan::TableFunction(node) => {
-                // The analysis output is surfaced under the FROM alias, like a
-                // derived table's columns.
-                let columns = table_function_columns(node);
-                scope.push((node.alias.clone(), Table::new(node.alias.clone(), columns)));
                 Ok(())
             }
             LogicalPlan::Unnest(node) => {
@@ -1345,20 +1330,6 @@ fn node_name(plan: &LogicalPlan) -> &'static str {
         LogicalPlan::SingleRowGuard(_) => "SingleRowGuard",
         LogicalPlan::GroupedLimit(_) => "GroupedLimit",
         LogicalPlan::LateralJoin(_) => "LateralJoin",
-        LogicalPlan::TableFunction(_) => "TableFunction",
         LogicalPlan::Unnest(_) => "Unnest",
     }
-}
-
-/// The surfaced output columns of a table-valued analysis call: the FROM item's
-/// column names carrying the analysis kind's fixed types. The two lists are
-/// parallel by construction (the parser enforces the count), so they zip.
-fn table_function_columns(node: &TableFunction) -> Vec<Column> {
-    let mut columns = Vec::with_capacity(node.output_names.len());
-    for (name, (_default_name, data_type)) in
-        node.output_names.iter().zip(node.call.output_columns())
-    {
-        columns.push(Column::new(name.clone(), data_type, true));
-    }
-    columns
 }

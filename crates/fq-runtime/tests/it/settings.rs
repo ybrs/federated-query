@@ -24,10 +24,46 @@ fn empty_config() -> Config {
         server: ServerConfig::default(),
         accelerator: fq_common::AcceleratorConfig::default(),
         catalog: fq_common::CatalogConfig::default(),
-        events: fq_common::EventsConfig::default(),
         diagnostics: fq_common::DiagnosticsConfig::default(),
         source_path: None,
     }
+}
+
+/// Unsupported statements fail without poisoning ordinary query execution.
+#[test]
+fn unsupported_analysis_statements_raise() {
+    let runtime = Runtime::from_config(&empty_config()).expect("from_config");
+    for sql in unsupported_analysis_sql() {
+        assert!(
+            runtime.execute(sql).is_err(),
+            "accepted unsupported SQL: {sql}"
+        );
+    }
+    runtime
+        .execute("SELECT 1 AS value")
+        .expect("runtime remains usable");
+}
+
+/// Cover standalone DDL, analyses, relational calls, and unknown settings.
+fn unsupported_analysis_sql() -> [&'static str; 16] {
+    [
+        "CREATE EVENT DATASET web FROM raw ACTOR actor TIME ts EVENT name",
+        "REFRESH EVENT DATASET web",
+        "REBUILD EVENT DATASET web",
+        "COMPACT EVENT DATASET web",
+        "DROP EVENT DATASET web",
+        "SHOW EVENT DATASETS",
+        "SHOW EVENTS FROM web",
+        "FUNNEL ('view', 'buy') ON web WINDOW 7 DAY",
+        "RETENTION ON web BIRTH 'view' RETURN 'buy' PERIOD DAY",
+        "SEGMENT count ON web BUCKET DAY",
+        "PATHS ON web DEPTH 3 TOP 10",
+        "SELECT * FROM funnel('web', 'view', 'buy', window => '7 days')",
+        "SELECT * FROM retention('web', birth => 'view', return => 'buy', period => 'day')",
+        "SELECT * FROM segment('web', measure => 'count', bucket => 'day')",
+        "SELECT * FROM paths('web')",
+        "SET events.build_memory_bytes = 1048576",
+    ]
 }
 
 /// Downcast a result column to its string values (the SHOW result is all text).
@@ -445,31 +481,31 @@ fn a_set_survives_into_a_new_runtime_over_the_same_store() {
     let config = stored_config("persist");
     let runtime = Runtime::from_config(&config).expect("from_config");
     runtime
-        .execute("SET events.build_memory_bytes = 12345678901")
+        .execute("SET executor.max_memory_mb = 12345")
         .expect("set");
     drop(runtime);
 
     // A fresh runtime over the same config re-applies the persisted SET.
     let runtime = Runtime::from_config(&config).expect("from_config");
     let (_, batches) = runtime
-        .execute("SHOW SETTING events.build_memory_bytes")
+        .execute("SHOW SETTING executor.max_memory_mb")
         .expect("show");
     assert!(
-        result_contains(&batches, "12345678901"),
+        result_contains(&batches, "12345"),
         "persisted value visible after restart"
     );
 
     // RESET removes the persisted row: the next runtime is back on defaults.
     runtime
-        .execute("RESET events.build_memory_bytes")
+        .execute("RESET executor.max_memory_mb")
         .expect("reset");
     drop(runtime);
     let runtime = Runtime::from_config(&config).expect("from_config");
     let (_, batches) = runtime
-        .execute("SHOW SETTING events.build_memory_bytes")
+        .execute("SHOW SETTING executor.max_memory_mb")
         .expect("show");
     assert!(
-        !result_contains(&batches, "12345678901"),
+        !result_contains(&batches, "12345"),
         "reset value gone after restart"
     );
 }
