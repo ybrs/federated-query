@@ -98,6 +98,7 @@ fn cross_config(duck_path: &str, database: &str) -> Config {
         },
     );
     Config {
+        storage: fq_common::StorageConfig::default(),
         datasources,
         optimizer: OptimizerConfig::default(),
         executor: ExecutorConfig::default(),

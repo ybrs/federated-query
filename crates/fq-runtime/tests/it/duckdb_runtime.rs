@@ -78,6 +78,7 @@ fn duck_config(path: &str) -> Config {
         },
     );
     Config {
+        storage: fq_common::StorageConfig::default(),
         datasources,
         optimizer: OptimizerConfig::default(),
         executor: ExecutorConfig::default(),

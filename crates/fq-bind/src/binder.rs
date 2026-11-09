@@ -25,7 +25,7 @@ use fq_common::update;
 use fq_plan::expr::ColumnRef;
 use fq_plan::{
     Aggregate, Cte, CteRef, Explain, Expr, Filter, Join, LateralJoin, Limit, LogicalPlan,
-    Projection, Scan, SetOperation, Sort, SubqueryScan, Values,
+    Projection, Scan, SetOperation, Sort, SubqueryOrigin, SubqueryScan, Values,
 };
 
 use crate::error::BindError;
@@ -180,6 +180,19 @@ impl<'a> Binder<'a> {
         let Some(qualifier) = table.qualifier() else {
             return Ok(());
         };
+        if let Some(relation) =
+            self.catalog
+                .stored_relation(&qualifier.datasource, &qualifier.schema_name, &table.name)
+        {
+            let object = fq_common::security::ObjectKey::MaterializedView { relation };
+            if authorizer.authorize_object(&object) {
+                return Ok(());
+            }
+            return Err(BindError::TableNotFound(format!(
+                "{}.{}.{}",
+                qualifier.datasource, qualifier.schema_name, table.name
+            )));
+        }
         if authorizer.authorize_select(&qualifier.datasource, &qualifier.schema_name, &table.name) {
             return Ok(());
         }
@@ -187,6 +200,28 @@ impl<'a> Binder<'a> {
             "{}.{}.{}",
             qualifier.datasource, qualifier.schema_name, table.name
         )))
+    }
+
+    /// Authorize a stored-view expansion by its durable relation identity.
+    /// The view's dependencies are then bound under the same invoker, so a
+    /// view grant never authorizes the underlying tables directly.
+    fn authorize_stored_view(&self, node: &SubqueryScan) -> Result<(), BindError> {
+        let SubqueryOrigin::StoredView(access) = node.origin else {
+            return Ok(());
+        };
+        if self.superuser {
+            return Ok(());
+        }
+        let Some(authorizer) = self.authorizer else {
+            return Ok(());
+        };
+        let object = fq_common::security::ObjectKey::View {
+            relation: access.relation,
+        };
+        if authorizer.authorize_object(&object) {
+            return Ok(());
+        }
+        Err(BindError::TableNotFound(node.alias.clone()))
     }
 
     /// Bind a Filter: bind the input, then the predicate against the input scope.
@@ -437,6 +472,7 @@ impl<'a> Binder<'a> {
     /// Bind a derived table: bind its inner plan, applying any column-alias
     /// rename. The alias itself scopes references above it.
     fn bind_subquery_scan(&mut self, mut node: SubqueryScan) -> Result<LogicalPlan, BindError> {
+        self.authorize_stored_view(&node)?;
         let input = self.bind(*node.input)?;
         let input = match &node.column_names {
             Some(names) => self.rename_derived_columns(input, names)?,
@@ -1117,6 +1153,7 @@ fn expose_group_order(mut sort: Sort) -> Sort {
         input: sort.input,
         alias: "__fq_group_order".into(),
         column_names: None,
+        origin: SubqueryOrigin::Derived,
     }));
     sort.sort_keys = sort
         .sort_keys

@@ -31,6 +31,10 @@ struct Cli {
     #[arg(short, long, value_name = "YAML")]
     config: PathBuf,
 
+    /// Database namespace used for every statement in this process.
+    #[arg(long, default_value = "main")]
+    database: String,
+
     /// A single SQL statement to run, then exit (one-shot mode).
     #[arg(long, value_name = "SQL", conflicts_with = "file")]
     command: Option<String>,
@@ -81,7 +85,8 @@ fn run(cli: &Cli) -> Result<(), String> {
         .ok_or_else(|| format!("config path is not valid UTF-8: {}", cli.config.display()))?;
     let config = load_config(config_path)
         .map_err(|error| format!("failed to load config {config_path}: {error}"))?;
-    let runtime = Runtime::from_config(&config).map_err(|error| error.to_string())?;
+    let runtime = Runtime::from_config_in_database(&config, &cli.database)
+        .map_err(|error| error.to_string())?;
     match one_shot_sql(cli)? {
         Some(sql) => run_once(&runtime, &sql, cli.format, cli.timings),
         None => repl::run(&runtime, cli.format, cli.timings).map_err(|error| error.to_string()),

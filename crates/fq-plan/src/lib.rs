@@ -24,7 +24,7 @@ pub use expr::{
 pub use logical::{
     Aggregate, AggregateFunction, Cte, CteRef, Explain, ExplainFormat, Filter, GroupedLimit, Join,
     JoinType, LateralJoin, Limit, LogicalPlan, Projection, Scan, SetOpKind, SetOperation,
-    SingleRowGuard, Sort, SubqueryScan, Union, Unnest, Values,
+    SingleRowGuard, Sort, SubqueryOrigin, SubqueryScan, Union, Unnest, Values,
 };
 pub use physical::{
     output_column_names, physical_column_name, BuildSide, ColumnAliasMap, DatasourceKind,

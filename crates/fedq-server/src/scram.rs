@@ -33,6 +33,7 @@ use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use fq_scram::{ScramServer, MECHANISM};
 
 use crate::auth::StoreAuthSource;
+use crate::session::{Session, SessionIdentity};
 
 /// The per-connection SASL state machine for the vendored handshake.
 enum ScramFlow {
@@ -43,6 +44,7 @@ enum ScramFlow {
     AwaitingFinal {
         server: Box<ScramServer>,
         username: String,
+        principal: Option<fq_common::database::PrincipalId>,
     },
     /// Authentication completed.
     Done,
@@ -50,6 +52,7 @@ enum ScramFlow {
 
 /// The vendored SCRAM-SHA-256 startup handler for one connection.
 pub struct ScramStartupHandler {
+    session: Arc<Session>,
     auth: Arc<StoreAuthSource>,
     manager: Arc<ConnectionManager>,
     provider: DefaultServerParameterProvider,
@@ -59,8 +62,13 @@ pub struct ScramStartupHandler {
 
 impl ScramStartupHandler {
     /// Build the handler over the shared verifier source and connection manager.
-    pub fn new(auth: Arc<StoreAuthSource>, manager: Arc<ConnectionManager>) -> Self {
+    pub fn new(
+        auth: Arc<StoreAuthSource>,
+        manager: Arc<ConnectionManager>,
+        session: Arc<Session>,
+    ) -> Self {
         Self {
+            session,
             auth,
             manager,
             provider: DefaultServerParameterProvider::default(),
@@ -84,8 +92,12 @@ impl ScramStartupHandler {
         let current = std::mem::replace(&mut *self.state.lock().await, ScramFlow::Done);
         match current {
             ScramFlow::Initial => self.on_client_first(client, message).await,
-            ScramFlow::AwaitingFinal { server, username } => {
-                self.on_client_final(client, message, &server, &username)
+            ScramFlow::AwaitingFinal {
+                server,
+                username,
+                principal,
+            } => {
+                self.on_client_final(client, message, &server, &username, principal)
                     .await
             }
             ScramFlow::Done => Err(PgWireError::InvalidSASLState),
@@ -117,8 +129,8 @@ impl ScramStartupHandler {
             .user()
             .unwrap_or_default()
             .to_owned();
-        let verifier = self.auth.verifier_for(&username);
-        let (server_first, server) = ScramServer::start(verifier, &client_first)
+        let credential = self.auth.credential_for(&username)?;
+        let (server_first, server) = ScramServer::start(credential.verifier, &client_first)
             .map_err(|error| PgWireError::InvalidScramMessage(error.to_string()))?;
         client
             .send(PgWireBackendMessage::Authentication(
@@ -128,6 +140,7 @@ impl ScramStartupHandler {
         *self.state.lock().await = ScramFlow::AwaitingFinal {
             server: Box::new(server),
             username,
+            principal: credential.principal,
         };
         Ok(())
     }
@@ -142,6 +155,7 @@ impl ScramStartupHandler {
         message: PasswordMessageFamily,
         server: &ScramServer,
         username: &str,
+        principal: Option<fq_common::database::PrincipalId>,
     ) -> PgWireResult<()>
     where
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
@@ -158,6 +172,13 @@ impl ScramStartupHandler {
                 return Err(PgWireError::InvalidPassword(username.to_owned()));
             }
         };
+        let principal =
+            principal.ok_or_else(|| PgWireError::InvalidPassword(username.to_owned()))?;
+        let database = crate::handler::startup_database(client)?;
+        self.session
+            .initialize(database, SessionIdentity::Authenticated(principal))
+            .await
+            .map_err(|error| crate::handler::engine_error(&error))?;
         client
             .send(PgWireBackendMessage::Authentication(
                 Authentication::SASLFinal(authenticated.server_final.into_bytes().into()),

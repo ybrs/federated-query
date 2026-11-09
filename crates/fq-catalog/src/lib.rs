@@ -20,6 +20,7 @@ pub mod datasource;
 pub mod error;
 pub mod schema;
 pub mod stats_catalog;
+pub mod store;
 
 pub use catalog::{Catalog, ViewDef};
 pub use datasource::{

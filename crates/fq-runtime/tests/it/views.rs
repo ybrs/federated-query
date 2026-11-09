@@ -95,6 +95,7 @@ fn config_for(dir: &Path, sources: &[(&str, &Path)]) -> Config {
         );
     }
     Config {
+        storage: fq_common::StorageConfig::default(),
         datasources,
         optimizer: OptimizerConfig::default(),
         executor: ExecutorConfig::default(),
@@ -185,6 +186,27 @@ fn view_survives_a_runtime_restart() {
         .execute("SELECT count(*) AS n FROM allev")
         .expect("select from persisted view");
     assert_eq!(one_count(&batches), 3);
+}
+
+#[test]
+fn an_open_session_sees_a_view_created_by_another_session() {
+    let dir = sandbox("live_refresh");
+    let events = dir.join("ev.parquet");
+    write_events(&events);
+    let config = config_for(&dir, &[("eva", &events)]);
+    let reader = Runtime::from_config(&config).expect("reader");
+    let writer = Runtime::from_config(&config).expect("writer");
+    assert!(reader.execute("SELECT count(*) FROM buys").is_err());
+    writer
+        .execute("CREATE VIEW buys AS SELECT user_id FROM eva.main.eva WHERE event = 'buy'")
+        .expect("create view");
+    // No reconnect: the reader's next statement plans against the new view.
+    let (_, batches) = reader
+        .execute("SELECT count(*) AS n FROM buys")
+        .expect("select from view created by another session");
+    assert_eq!(one_count(&batches), 1);
+    writer.execute("DROP VIEW buys").expect("drop view");
+    assert!(reader.execute("SELECT count(*) FROM buys").is_err());
 }
 
 #[test]

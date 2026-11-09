@@ -77,6 +77,7 @@ impl Sandbox {
             },
         );
         Config {
+            storage: fq_common::StorageConfig::default(),
             datasources,
             optimizer: OptimizerConfig::default(),
             executor: ExecutorConfig::default(),
@@ -108,7 +109,7 @@ impl Sandbox {
 
     /// The store root the runtime derives from this sandbox's config path.
     fn store_root(&self) -> PathBuf {
-        self.dir.join("config.mv")
+        super::storage::main_paths(&self.dir.join("config.data")).materialized
     }
 }
 

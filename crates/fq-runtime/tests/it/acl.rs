@@ -13,7 +13,8 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use fq_accel::Accelerator;
+use fq_catalog::store::{DatabaseCatalog, ServerCatalog};
+use fq_common::security::{GrantSubject, ObjectKey};
 use fq_common::{
     Config, CostConfig, DataSourceConfig, ExecutorConfig, OptimizerConfig, ServerConfig,
     UserCredential,
@@ -21,6 +22,7 @@ use fq_common::{
 use fq_connectors::DuckDbSource;
 use fq_runtime::Runtime;
 use serde_yaml::Value;
+use std::sync::Arc;
 
 /// A per-test sandbox holding a seeded DuckDB file and the config path the ACL
 /// store hangs off.
@@ -62,6 +64,7 @@ impl Sandbox {
         let mut datasources = BTreeMap::new();
         datasources.insert("duck".to_string(), duck_bootstrap(&self.seed_duck()));
         Config {
+            storage: fq_common::StorageConfig::default(),
             datasources,
             optimizer: OptimizerConfig::default(),
             executor: ExecutorConfig::default(),
@@ -77,13 +80,25 @@ impl Sandbox {
     /// A runtime over the sandbox config (an embedded implicit superuser until a
     /// principal is set).
     fn runtime(&self) -> Runtime {
-        Runtime::from_config(&self.config()).expect("from_config")
+        let runtime = Runtime::from_config(&self.config()).expect("from_config");
+        run(&runtime, "GRANT CONNECT ON DATABASE main TO PUBLIC");
+        runtime
     }
 
-    /// A second accelerator over this sandbox's store, standing in for another
+    /// A second identity catalog over this sandbox's store, standing in for another
     /// session that mutates grants concurrently.
-    fn accelerator(&self) -> Accelerator {
-        Accelerator::open(&self.dir.join("config.yaml")).expect("open accelerator")
+    fn server_catalog(&self) -> Arc<ServerCatalog> {
+        let manager =
+            fq_runtime::DatabaseManager::open(&self.dir.join("config.data")).expect("manager");
+        Arc::clone(manager.server_catalog())
+    }
+
+    /// Open local grants without rebuilding or reseeding the DuckDB fixture.
+    fn database_catalog(&self) -> DatabaseCatalog {
+        let manager =
+            fq_runtime::DatabaseManager::open(&self.dir.join("config.data")).expect("manager");
+        let database = manager.acquire("main").expect("main");
+        DatabaseCatalog::open(&database.paths.metadata.to_string_lossy()).expect("local catalog")
     }
 }
 
@@ -107,6 +122,7 @@ fn server_with_admin() -> ServerConfig {
         .expect("derive")
         .to_authid_string();
     ServerConfig {
+        auth: fq_common::security::AuthMode::Scram,
         users: vec![UserCredential {
             name: "admin".to_string(),
             verifier,
@@ -208,9 +224,21 @@ fn a_revoke_by_another_session_denies_the_next_query() {
     assert!(can_see(&runtime, "SELECT id FROM duck.main.orders"));
     // A second session revokes; the generation bump makes it visible at carl's
     // NEXT query with no reconnect.
-    let peer = sandbox.accelerator();
+    let carl = sandbox
+        .server_catalog()
+        .get_user("carl")
+        .expect("read")
+        .expect("carl");
+    let peer = sandbox.database_catalog();
     assert!(peer
-        .revoke("carl", "SELECT", "table", "duck.main.orders")
+        .revoke(
+            GrantSubject::User(carl.id),
+            &ObjectKey::Table {
+                datasource: "duck".to_string(),
+                schema: "main".to_string(),
+                table: "orders".to_string(),
+            }
+        )
         .expect("revoke"));
     assert!(!can_see(&runtime, "SELECT id FROM duck.main.orders"));
 }
@@ -226,15 +254,121 @@ fn admin_ddl_is_superuser_only() {
         .unwrap_err()
         .to_string();
     assert!(
-        error.contains("requires superuser"),
+        error.contains("SUPERUSER"),
         "non-superuser DDL error: {error}"
     );
 }
 
 #[test]
+fn a_view_grant_checks_the_view_and_its_dependencies() {
+    let sandbox = Sandbox::new("view_grant");
+    let runtime = sandbox.runtime();
+    run(&runtime, "CREATE USER bob WITH PASSWORD 'pw'");
+    run(
+        &runtime,
+        "CREATE VIEW big_orders AS SELECT id, total FROM duck.main.orders WHERE total > 15",
+    );
+    run(&runtime, "GRANT SELECT ON VIEW big_orders TO bob");
+    runtime.set_principal("bob").expect("set principal");
+    // The view grant alone does not authorize its underlying table (invoker).
+    assert!(!can_see(&runtime, "SELECT id FROM big_orders"));
+    // With the dependency granted too, the view binds and executes.
+    let bob = sandbox
+        .server_catalog()
+        .get_user("bob")
+        .expect("read")
+        .expect("bob");
+    let peer = sandbox.database_catalog();
+    peer.grant(
+        GrantSubject::User(bob.id),
+        &ObjectKey::Table {
+            datasource: "duck".to_string(),
+            schema: "main".to_string(),
+            table: "orders".to_string(),
+        },
+        "admin",
+    )
+    .expect("grant table");
+    let (_schema, batches) = runtime
+        .execute("SELECT id FROM big_orders")
+        .expect("authorized view query runs");
+    let rows: usize = batches
+        .iter()
+        .map(arrow::array::RecordBatch::num_rows)
+        .sum();
+    assert_eq!(rows, 1);
+    // Revoking the view grant denies the view even though the table grant remains.
+    let view = peer
+        .find_relation("big_orders")
+        .expect("read")
+        .expect("view");
+    assert!(peer
+        .revoke(
+            GrantSubject::User(bob.id),
+            &ObjectKey::View { relation: view.id }
+        )
+        .expect("revoke view"));
+    assert!(!can_see(&runtime, "SELECT id FROM big_orders"));
+    assert!(can_see(&runtime, "SELECT id FROM duck.main.orders"));
+}
+
+#[test]
+fn a_materialized_view_grant_authorizes_the_stored_result() {
+    let sandbox = Sandbox::new("mv_grant");
+    let runtime = sandbox.runtime();
+    run(&runtime, "CREATE USER bob WITH PASSWORD 'pw'");
+    run(
+        &runtime,
+        "CREATE MATERIALIZED VIEW mv_orders AS SELECT id, total FROM duck.main.orders",
+    );
+    // The SQL grant surface resolves the MV's durable relation identity.
+    run(&runtime, "CREATE USER dana WITH PASSWORD 'pw'");
+    run(
+        &runtime,
+        "GRANT SELECT ON MATERIALIZED VIEW mv_orders TO dana",
+    );
+    runtime.set_principal("bob").expect("set principal");
+    // No grant: the stored result is indistinguishable from a missing table.
+    assert!(!can_see(&runtime, "SELECT id FROM mv_orders"));
+    // Grant through the real SQL surface from a peer catalog handle, then the
+    // already-open restricted session sees the stored result at its next query.
+    let bob = sandbox
+        .server_catalog()
+        .get_user("bob")
+        .expect("read")
+        .expect("bob");
+    let peer = sandbox.database_catalog();
+    let mv = peer.find_relation("mv_orders").expect("read").expect("mv");
+    peer.grant(
+        GrantSubject::User(bob.id),
+        &ObjectKey::MaterializedView { relation: mv.id },
+        "admin",
+    )
+    .expect("grant mv");
+    // The MV grant alone authorizes the stored result, not the source table.
+    assert!(can_see(&runtime, "SELECT id FROM mv_orders"));
+    assert!(!can_see(&runtime, "SELECT id FROM duck.main.orders"));
+    let (_schema, batches) = runtime
+        .execute("SELECT id FROM mv_orders")
+        .expect("authorized MV query runs");
+    let rows: usize = batches
+        .iter()
+        .map(arrow::array::RecordBatch::num_rows)
+        .sum();
+    assert_eq!(rows, 2);
+    assert!(peer
+        .revoke(
+            GrantSubject::User(bob.id),
+            &ObjectKey::MaterializedView { relation: mv.id }
+        )
+        .expect("revoke mv"));
+    assert!(!can_see(&runtime, "SELECT id FROM mv_orders"));
+}
+
+#[test]
 fn bootstrap_refuses_to_start_without_a_superuser() {
     let sandbox = Sandbox::new("no_su");
-    let accel = sandbox.accelerator();
+    let accel = sandbox.server_catalog();
     let verifier = fq_scram::derive_verifier_random_salt("pw", 4096)
         .expect("derive")
         .to_authid_string();

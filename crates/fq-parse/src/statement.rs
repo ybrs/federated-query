@@ -40,6 +40,12 @@ use crate::error::ParseError;
 /// as text for the normal parse pipeline.
 #[derive(Debug, PartialEq)]
 pub enum Statement<'a> {
+    /// Reserve and initialize one database in the server catalog.
+    CreateDatabase { name: String },
+    /// Remove an inactive database and all of its owned storage.
+    DropDatabase { name: String },
+    /// List databases visible to the session identity.
+    ShowDatabases,
     /// Anything that is not a recognized statement form; the full original text.
     Query(&'a str),
     /// `CREATE MATERIALIZED VIEW <name> AS <select>`: the view name and the
@@ -117,6 +123,18 @@ pub enum Statement<'a> {
     AlterUserSuperuser { name: String, superuser: bool },
     /// `DROP USER <name>`.
     DropUser { name: String },
+    /// `GRANT CONNECT | ADMIN ON DATABASE <name> TO <grantee>`.
+    GrantDatabase {
+        name: String,
+        grantee: String,
+        privilege: fq_common::security::DatabasePrivilege,
+    },
+    /// `REVOKE CONNECT | ADMIN ON DATABASE <name> FROM <grantee>`.
+    RevokeDatabase {
+        name: String,
+        grantee: String,
+        privilege: fq_common::security::DatabasePrivilege,
+    },
     /// `GRANT SELECT ON <object> TO <grantee>`.
     Grant {
         object: GrantObject,
@@ -138,10 +156,15 @@ pub enum Statement<'a> {
 /// there is no wildcard syntax).
 #[derive(Debug, PartialEq, Eq)]
 pub enum GrantObject {
+    View(fq_common::database::RelationName),
+    MaterializedView(fq_common::database::RelationName),
     /// `DATASOURCE <d>`: authorizes every schema and table under `d`.
     Datasource(String),
     /// `SCHEMA <d>.<s>`: authorizes every table under `d.s`.
-    Schema { datasource: String, schema: String },
+    Schema {
+        datasource: String,
+        schema: String,
+    },
     /// `TABLE <d>.<s>.<t>`: authorizes exactly that table.
     Table {
         datasource: String,
@@ -154,6 +177,8 @@ impl GrantObject {
     /// The `object_kind` string persisted for this level.
     pub fn kind(&self) -> &'static str {
         match self {
+            GrantObject::View(_) => "view",
+            GrantObject::MaterializedView(_) => "materialized_view",
             GrantObject::Datasource(_) => "datasource",
             GrantObject::Schema { .. } => "schema",
             GrantObject::Table { .. } => "table",
@@ -163,6 +188,7 @@ impl GrantObject {
     /// The canonical dotted `object_path` persisted for this object.
     pub fn path(&self) -> String {
         match self {
+            GrantObject::View(name) | GrantObject::MaterializedView(name) => name.to_string(),
             GrantObject::Datasource(datasource) => datasource.clone(),
             GrantObject::Schema { datasource, schema } => format!("{datasource}.{schema}"),
             GrantObject::Table {
@@ -184,6 +210,9 @@ pub fn classify_statement(sql: &str) -> Result<Statement<'_>, ParseError> {
         return Ok(Statement::Query(sql));
     };
     match first.to_ascii_uppercase().as_str() {
+        "CREATE" if second_word_is(sql, "DATABASE") => classify_create_database(&mut tokens),
+        "DROP" if second_word_is(sql, "DATABASE") => classify_drop_database(&mut tokens),
+        "SHOW" if second_word_is(sql, "DATABASES") => classify_show_databases(&mut tokens),
         "REFRESH" => classify_refresh(&mut tokens),
         "CREATE" if second_word_is(sql, "MATERIALIZED") => classify_create(&mut tokens),
         "CREATE" if second_word_is(sql, "VIEW") => classify_create_view(&mut tokens, false),
@@ -699,6 +728,9 @@ fn classify_drop_user<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement<'a>, P
 /// Parse `GRANT SELECT ON <object> TO <grantee>`.
 fn classify_grant<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement<'a>, ParseError> {
     tokens.expect_keyword("GRANT")?;
+    if tokens.peek_word_is("CONNECT") || tokens.peek_word_is("ADMIN") {
+        return classify_database_access(tokens, true);
+    }
     require_select(tokens)?;
     tokens.expect_keyword("ON")?;
     let object = read_grant_object(tokens)?;
@@ -711,6 +743,9 @@ fn classify_grant<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement<'a>, Parse
 /// Parse `REVOKE SELECT ON <object> FROM <grantee>`.
 fn classify_revoke<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement<'a>, ParseError> {
     tokens.expect_keyword("REVOKE")?;
+    if tokens.peek_word_is("CONNECT") || tokens.peek_word_is("ADMIN") {
+        return classify_database_access(tokens, false);
+    }
     require_select(tokens)?;
     tokens.expect_keyword("ON")?;
     let object = read_grant_object(tokens)?;
@@ -718,6 +753,38 @@ fn classify_revoke<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement<'a>, Pars
     let grantee = read_grantee(tokens)?;
     expect_end(tokens, "REVOKE")?;
     Ok(Statement::Revoke { object, grantee })
+}
+
+/// Parse only the explicit database authority grammar, preserving quoted names.
+fn classify_database_access<'a>(
+    tokens: &mut Tokenizer<'a>,
+    grant: bool,
+) -> Result<Statement<'a>, ParseError> {
+    let privilege = if tokens.peek_word_is("ADMIN") {
+        tokens.expect_keyword("ADMIN")?;
+        fq_common::security::DatabasePrivilege::Admin
+    } else {
+        tokens.expect_keyword("CONNECT")?;
+        fq_common::security::DatabasePrivilege::Connect
+    };
+    tokens.expect_keyword("ON")?;
+    tokens.expect_keyword("DATABASE")?;
+    let name = acl_identifier(tokens, "database")?;
+    tokens.expect_keyword(if grant { "TO" } else { "FROM" })?;
+    let grantee = read_grantee(tokens)?;
+    expect_end(tokens, "database privilege")?;
+    if grant {
+        return Ok(Statement::GrantDatabase {
+            name,
+            grantee,
+            privilege,
+        });
+    }
+    Ok(Statement::RevokeDatabase {
+        name,
+        grantee,
+        privilege,
+    })
 }
 
 /// Require the single grantable privilege `SELECT`; any other privilege raises
@@ -754,6 +821,15 @@ fn read_grant_object(tokens: &mut Tokenizer<'_>) -> Result<GrantObject, ParseErr
         }
     };
     match level.as_str() {
+        "VIEW" => Ok(GrantObject::View(
+            crate::relation_names::read_relation_name(tokens)?,
+        )),
+        "MATERIALIZED" => {
+            tokens.expect_keyword("VIEW")?;
+            Ok(GrantObject::MaterializedView(
+                crate::relation_names::read_relation_name(tokens)?,
+            ))
+        }
         "DATASOURCE" => Ok(GrantObject::Datasource(read_ident(tokens, "datasource")?)),
         "SCHEMA" => read_schema_object(tokens),
         "TABLE" => read_table_object(tokens),
@@ -803,7 +879,7 @@ fn read_grantee(tokens: &mut Tokenizer<'_>) -> Result<String, ParseError> {
 /// Read one identifier of an object path: a bare word lowercases (Postgres
 /// rule), a quoted identifier keeps its spelling. Does not consume a following
 /// dot (the caller drives the path structure).
-fn read_ident(tokens: &mut Tokenizer<'_>, what: &str) -> Result<String, ParseError> {
+pub(crate) fn read_ident(tokens: &mut Tokenizer<'_>, what: &str) -> Result<String, ParseError> {
     let name = match tokens.next_token() {
         Some(Token::Word(word)) => word.to_lowercase(),
         Some(Token::QuotedIdent(name)) => name,
@@ -1106,21 +1182,7 @@ fn classify_drop<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement<'a>, ParseE
 /// exact spelling. A qualified name (`schema.view`) raises: the view store is
 /// a single flat namespace. `what` names the object kind in error text.
 pub(crate) fn view_name(tokens: &mut Tokenizer<'_>, what: &str) -> Result<String, ParseError> {
-    let name = match tokens.next_token() {
-        Some(Token::Word(word)) => word.to_lowercase(),
-        Some(Token::QuotedIdent(name)) => name,
-        Some(Token::Other(ch)) => {
-            return Err(ParseError::Parse(format!(
-                "expected a {what} name, found '{ch}'"
-            )))
-        }
-        Some(Token::StringLiteral(_)) | None => {
-            return Err(ParseError::Parse(format!("expected a {what} name")))
-        }
-    };
-    if name.is_empty() {
-        return Err(ParseError::Parse(format!("{what} name is empty")));
-    }
+    let name = read_ident(tokens, what)?;
     if matches!(tokens.peek(), Some(Token::Other('.'))) {
         return Err(ParseError::Unsupported(format!(
             "{what} name '{name}...' is schema-qualified; the view \
@@ -1159,6 +1221,8 @@ pub(crate) enum Token<'a> {
     StringLiteral(String),
     /// Any other single character (punctuation, operator).
     Other(char),
+    /// A quote reaching end of input cannot become a valid identifier or literal.
+    UnterminatedQuote(char),
 }
 
 impl Token<'_> {
@@ -1169,6 +1233,7 @@ impl Token<'_> {
             Token::QuotedIdent(name) => format!("\"{name}\""),
             Token::StringLiteral(content) => format!("'{content}'"),
             Token::Other(ch) => ch.to_string(),
+            Token::UnterminatedQuote(quote) => format!("unterminated {quote} quote"),
         }
     }
 }
@@ -1267,9 +1332,7 @@ impl<'a> Tokenizer<'a> {
         Token::Word(&self.input[start..self.pos])
     }
 
-    /// Read a quoted token (`"` identifier or `'` string) with doubled-quote
-    /// escapes. An unterminated quote consumes to end of input; the DDL layer
-    /// then fails on the malformed shape rather than misreading past the quote.
+    /// Decode doubled quotes and retain unterminated input as an explicit invalid token.
     fn read_quoted(&mut self, quote: char) -> Token<'a> {
         self.pos += quote.len_utf8();
         let mut content = String::new();
@@ -1277,29 +1340,55 @@ impl<'a> Tokenizer<'a> {
         while let Some(ch) = chars.next() {
             self.pos += ch.len_utf8();
             if ch == quote {
-                // A doubled quote is an escaped quote character; anything else
-                // closes the token.
-                if chars.peek() == Some(&quote) {
-                    chars.next();
-                    self.pos += quote.len_utf8();
-                    content.push(quote);
-                    continue;
+                if chars.peek() != Some(&quote) {
+                    return quoted_token(quote, content);
                 }
-                break;
+                chars.next();
+                self.pos += quote.len_utf8();
             }
             content.push(ch);
         }
-        if quote == '"' {
-            Token::QuotedIdent(content)
-        } else {
-            Token::StringLiteral(content)
-        }
+        Token::UnterminatedQuote(quote)
     }
+}
+
+/// Construct a completed quoted identifier or string literal.
+fn quoted_token(quote: char, content: String) -> Token<'static> {
+    if quote == '"' {
+        return Token::QuotedIdent(content);
+    }
+    Token::StringLiteral(content)
 }
 
 /// Whether a character continues a bare word token.
 fn is_word_char(ch: char) -> bool {
     ch.is_alphanumeric() || ch == '_' || ch == '$'
+}
+
+/// Parse database creation and reject unsupported options or extra tokens.
+fn classify_create_database<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement<'a>, ParseError> {
+    tokens.expect_keyword("CREATE")?;
+    tokens.expect_keyword("DATABASE")?;
+    let name = acl_identifier(tokens, "database")?;
+    expect_end(tokens, "CREATE DATABASE")?;
+    Ok(Statement::CreateDatabase { name })
+}
+
+/// Parse database removal without accepting silent missing-object options.
+fn classify_drop_database<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement<'a>, ParseError> {
+    tokens.expect_keyword("DROP")?;
+    tokens.expect_keyword("DATABASE")?;
+    let name = acl_identifier(tokens, "database")?;
+    expect_end(tokens, "DROP DATABASE")?;
+    Ok(Statement::DropDatabase { name })
+}
+
+/// Parse the server database listing without executing any source query.
+fn classify_show_databases<'a>(tokens: &mut Tokenizer<'a>) -> Result<Statement<'a>, ParseError> {
+    tokens.expect_keyword("SHOW")?;
+    tokens.expect_keyword("DATABASES")?;
+    expect_end(tokens, "SHOW DATABASES")?;
+    Ok(Statement::ShowDatabases)
 }
 
 #[cfg(test)]

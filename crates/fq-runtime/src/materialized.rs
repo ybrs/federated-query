@@ -28,11 +28,16 @@ use crate::Runtime;
 /// Open the materialized-view store that belongs to `config`, or None for a
 /// programmatically built config with no file path (there is nowhere to keep a
 /// store; DDL against such a runtime raises).
-pub fn open_accelerator(config: &fq_common::Config) -> Result<Option<Accelerator>, RuntimeError> {
-    let Some(source_path) = config.source_path.as_deref() else {
+pub fn open_accelerator(
+    database: Option<&crate::DatabaseLease>,
+) -> Result<Option<Accelerator>, RuntimeError> {
+    let Some(database) = database else {
         return Ok(None);
     };
-    Ok(Some(Accelerator::open(std::path::Path::new(source_path))?))
+    Ok(Some(Accelerator::open(
+        &database.paths.metadata,
+        &database.paths.materialized,
+    )?))
 }
 
 /// Register the store's current views in a catalog (as the datasource the
@@ -42,9 +47,24 @@ pub fn register_store(
     session: connectors::SessionId,
     catalog: &mut Catalog,
     accel: &Accelerator,
+    definitions: Option<&fq_catalog::store::DatabaseCatalog>,
 ) -> Result<(), RuntimeError> {
     let views = accel.views()?;
     register_data_plane(session, accel, &views)?;
+    if let Some(definitions) = definitions {
+        for view in &views {
+            if let Some(relation) = definitions.find_relation(&view.name)? {
+                if relation.kind == fq_common::database::RelationKind::MaterializedView {
+                    catalog.register_stored_relation(
+                        accel.datasource_name(),
+                        VIEW_SCHEMA_NAME,
+                        &view.name,
+                        relation.id,
+                    );
+                }
+            }
+        }
+    }
     catalog.register_datasource(Arc::new(MaterializedViewSource::new(
         accel.datasource_name(),
         views,
@@ -89,18 +109,44 @@ impl Runtime {
     ) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
         let accel = self.accelerator()?;
         let catalog = self.catalog_snapshot();
-        if let Some(holder) = self.relation_name_holder(name) {
+        if let Some(holder) = self.relation_name_holder(name)? {
             return Err(RuntimeError::MaterializedView(format!(
                 "relation '{name}' already exists ({holder})"
             )));
         }
-        let plan = delta::classify(&catalog, &self.config_snapshot(), select_sql)?;
-        let tokens = delta::read_tokens(&catalog, &plan.base_tables)?;
-        let (schema, batches) = self.execute_source_query(select_sql)?;
-        let state = initial_change_key_state(&plan, &schema, &batches);
-        accel.create_view(name, select_sql, &schema, &batches, tokens, state)?;
+        let definitions = self.database_catalog()?;
+        let reserved = definitions.reserve_relation(
+            name,
+            fq_common::database::RelationKind::MaterializedView,
+            &self.actor(),
+        )?;
+        let built = self.build_materialized_view(accel, &catalog, name, select_sql);
+        if let Err(error) = built {
+            definitions.drop_relation(reserved.id)?;
+            return Err(error);
+        }
+        definitions.publish_relation(reserved.id)?;
         self.install_views()?;
         status_result("CREATE MATERIALIZED VIEW")
+    }
+
+    /// Classify, pull, and persist one new materialized view's rows.
+    fn build_materialized_view(
+        &self,
+        accel: &Accelerator,
+        catalog: &Catalog,
+        name: &str,
+        select_sql: &str,
+    ) -> Result<(), RuntimeError> {
+        let bound = self.bind_definition(catalog, select_sql)?;
+        let plan = delta::classify_bound(&self.config_snapshot(), &bound);
+        let tokens = delta::read_tokens(catalog, &plan.base_tables)?;
+        let (planned, _no_substitutions) =
+            self.plan_inner(select_sql, crate::QueryPurpose::StoredSelect)?;
+        let (schema, batches) = self.execute_source_plan(&planned)?;
+        let state = initial_change_key_state(&plan, &schema, &batches);
+        accel.create_view(name, select_sql, &schema, &batches, tokens, state)?;
+        Ok(())
     }
 
     /// `REFRESH MATERIALIZED VIEW name`: bring the view forward and report HOW
@@ -121,8 +167,11 @@ impl Runtime {
         let accel = self.accelerator()?;
         let view = accel.view(name)?;
         let catalog = self.catalog_snapshot();
-        let plan = delta::classify(&catalog, &self.config_snapshot(), &view.definition_sql)?;
+        let bound = self.bind_definition(&catalog, &view.definition_sql)?;
+        let plan = delta::classify_bound(&self.config_snapshot(), &bound);
         let tokens = delta::read_tokens(&catalog, &plan.base_tables)?;
+        let (planned, _no_substitutions) =
+            self.plan_inner(&view.definition_sql, crate::QueryPurpose::StoredSelect)?;
         if delta::tokens_allow_skip(&view.source_tokens, &tokens, &plan.base_tables) {
             // Nothing is written: the stored row (chunks, tokens, watermark)
             // is already the current state.
@@ -130,7 +179,8 @@ impl Runtime {
         }
         let status = match &plan.decision {
             RefreshDecision::Whole { reason } => {
-                self.refresh_whole(accel, &view, &tokens, None, reason)?
+                let (schema, batches) = self.execute_source_plan(&planned)?;
+                Self::refresh_whole(accel, &view, &tokens, &schema, &batches, None, reason)?
             }
             RefreshDecision::Append { output_column } => {
                 self.refresh_append(accel, &view, &tokens, output_column)?
@@ -147,19 +197,19 @@ impl Runtime {
     /// the view is append-admissible (`append_column`) the fresh watermark is
     /// stored alongside, so the NEXT refresh can pull a delta.
     fn refresh_whole(
-        &self,
         accel: &Accelerator,
         view: &MaterializedView,
         tokens: &BTreeMap<String, String>,
+        schema: &SchemaRef,
+        batches: &[RecordBatch],
         append_column: Option<&str>,
         reason: &str,
     ) -> Result<String, RuntimeError> {
-        let (schema, batches) = self.execute_source_query(&view.definition_sql)?;
         let state = match append_column {
-            Some(column) => watermark_state(&schema, &batches, column),
+            Some(column) => watermark_state(schema, batches, column),
             None => None,
         };
-        accel.refresh_view(&view.name, &schema, &batches, tokens, state.as_ref())?;
+        accel.refresh_view(&view.name, schema, batches, tokens, state.as_ref())?;
         Ok(format!(
             "REFRESH MATERIALIZED VIEW (whole re-pull: {reason})"
         ))
@@ -179,7 +229,16 @@ impl Runtime {
         let watermark = match resolve_watermark(accel, view, output_column)? {
             Ok(watermark) => watermark,
             Err(reason) => {
-                return self.refresh_whole(accel, view, tokens, Some(output_column), &reason)
+                let (schema, batches) = self.execute_source_query(&view.definition_sql)?;
+                return Self::refresh_whole(
+                    accel,
+                    view,
+                    tokens,
+                    &schema,
+                    &batches,
+                    Some(output_column),
+                    &reason,
+                );
             }
         };
         let sql = delta::delta_sql(
@@ -191,10 +250,13 @@ impl Runtime {
         let (schema, batches) = self.execute_source_query(&sql)?;
         let stored_schema = accel.stored_arrow_schema(view)?;
         if stored_schema.fields() != schema.fields() {
-            return self.refresh_whole(
+            let (whole_schema, whole_batches) = self.execute_source_query(&view.definition_sql)?;
+            return Self::refresh_whole(
                 accel,
                 view,
                 tokens,
+                &whole_schema,
+                &whole_batches,
                 Some(output_column),
                 "the engine's result layout no longer matches the stored chunks",
             );
@@ -203,7 +265,17 @@ impl Runtime {
         let advanced = match advance_watermark(watermark, &schema, &batches, output_column)? {
             Ok(advanced) => advanced,
             Err(reason) => {
-                return self.refresh_whole(accel, view, tokens, Some(output_column), &reason)
+                let (whole_schema, whole_batches) =
+                    self.execute_source_query(&view.definition_sql)?;
+                return Self::refresh_whole(
+                    accel,
+                    view,
+                    tokens,
+                    &whole_schema,
+                    &whole_batches,
+                    Some(output_column),
+                    &reason,
+                );
             }
         };
         let state = ChangeKeyState {
@@ -253,6 +325,10 @@ impl Runtime {
     ) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
         let accel = self.accelerator()?;
         accel.drop_view(name)?;
+        let definitions = self.database_catalog()?;
+        if let Some(relation) = definitions.find_relation(name)? {
+            definitions.drop_relation(relation.id)?;
+        }
         self.install_views()?;
         status_result("DROP MATERIALIZED VIEW")
     }
@@ -282,6 +358,20 @@ impl Runtime {
             VIEW_SCHEMA_NAME,
             views_schema(accel.datasource_name(), &views),
         );
+        if let Some(definitions) = &self.database_catalog {
+            for view in &views {
+                if let Some(relation) = definitions.find_relation(&view.name)? {
+                    if relation.kind == fq_common::database::RelationKind::MaterializedView {
+                        next.register_stored_relation(
+                            accel.datasource_name(),
+                            VIEW_SCHEMA_NAME,
+                            &view.name,
+                            relation.id,
+                        );
+                    }
+                }
+            }
+        }
         next.register_datasource(Arc::new(MaterializedViewSource::new(
             accel.datasource_name(),
             views,

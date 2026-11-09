@@ -13,9 +13,11 @@
 
 pub mod budget;
 pub mod config;
+pub mod database;
 pub mod error;
 pub mod logging;
 mod nested_types;
+pub mod security;
 pub mod types;
 #[macro_use]
 mod update;
@@ -48,8 +50,8 @@ pub const MAX_PLAN_DEPTH: usize = 200;
 pub use budget::PlanBudget;
 pub use config::{
     load_config, AcceleratorConfig, CatalogConfig, ChangeKey, Config, CostConfig, DataSourceConfig,
-    DiagnosticsConfig, ExecutorConfig, OptimizerConfig, Principal, ServerConfig, UserCredential,
-    SCRAM_ITERATIONS,
+    DiagnosticsConfig, ExecutorConfig, OptimizerConfig, Principal, ServerConfig, StorageConfig,
+    UserCredential, SCRAM_ITERATIONS,
 };
 pub use error::{ConfigError, UnsupportedSqlError};
 pub use logging::setup_logging;

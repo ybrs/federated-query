@@ -24,7 +24,9 @@ use std::rc::Rc;
 
 use fq_decorrelate::helpers::replace_column_refs;
 use fq_plan::expr::{column_refs, combine_and, split_conjuncts, ColumnRef, Expr};
-use fq_plan::logical::{Aggregate, Join, JoinType, LogicalPlan, Scan, SubqueryScan};
+use fq_plan::logical::{
+    Aggregate, Join, JoinType, LogicalPlan, Scan, SubqueryOrigin, SubqueryScan,
+};
 
 use crate::cost::CostModel;
 use crate::error::OptimizeError;
@@ -667,6 +669,7 @@ fn build_final(
         input: Box::new(partial.aggregate.clone()),
         alias: partial.alias.clone(),
         column_names: None,
+        origin: SubqueryOrigin::Derived,
     });
     let mut in_scope: HashSet<String> = std::iter::once(partial.alias.clone()).collect();
     for scan in joinable_order(peeled, &pending, &in_scope)? {

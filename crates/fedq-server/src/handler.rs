@@ -30,28 +30,34 @@ use crate::auth::StoreAuthSource;
 use crate::encode;
 use crate::params;
 use crate::scram::ScramStartupHandler;
-use crate::session::Session;
+use crate::session::{Session, SessionError, SessionIdentity};
 
-/// The authenticated principal of a connection, read from the startup metadata
-/// (the SCRAM handshake verified the client knows this user's password). None in
-/// trust mode, where the runtime runs as an implicit superuser regardless.
-fn principal_of<C: ClientInfo>(client: &C) -> Option<String> {
+/// Require an explicit nonempty database before admitting a connection.
+pub(crate) fn startup_database<C: ClientInfo>(client: &C) -> PgWireResult<String> {
     LoginInfo::from_client_info(client)
-        .user()
+        .database()
+        .filter(|name| !name.is_empty())
         .map(str::to_owned)
+        .ok_or_else(|| {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "FATAL".to_string(),
+                "3D000".to_string(),
+                "an explicit database name is required".to_string(),
+            )))
+        })
 }
 
 /// One connection's query handler. Holds the `Session` that owns the connection's
 /// runtime thread and the parser that stores each extended-protocol statement as
 /// its verbatim SQL string.
 pub struct FedqBackend {
-    session: Session,
+    session: Arc<Session>,
     query_parser: Arc<NoopQueryParser>,
 }
 
 impl FedqBackend {
     /// Wrap a session as a query backend.
-    fn new(session: Session) -> Self {
+    fn new(session: Arc<Session>) -> Self {
         Self {
             session,
             query_parser: Arc::new(NoopQueryParser),
@@ -65,7 +71,7 @@ impl SimpleQueryHandler for FedqBackend {
     /// response, otherwise the SQL runs on the session and its Arrow result is
     /// encoded to Postgres rows. An engine error becomes an `ErrorResponse`
     /// carrying the engine's own message.
-    async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
+    async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::PortalStore: PortalStore,
@@ -77,9 +83,9 @@ impl SimpleQueryHandler for FedqBackend {
         }
         let result = self
             .session
-            .execute(query.to_owned(), principal_of(client))
+            .execute(query.to_owned())
             .await
-            .map_err(engine_error)?;
+            .map_err(|error| engine_error(&error))?;
         // The simple protocol always returns rows in text format.
         let response = encode::to_response(&result.schema, &result.batches, &Format::UnifiedText)?;
         Ok(vec![response])
@@ -104,7 +110,7 @@ impl ExtendedQueryHandler for FedqBackend {
     /// message's row limit to the returned response.
     async fn do_query<C>(
         &self,
-        client: &mut C,
+        _client: &mut C,
         portal: &Portal<Self::Statement>,
         _max_rows: usize,
     ) -> PgWireResult<Response>
@@ -117,9 +123,9 @@ impl ExtendedQueryHandler for FedqBackend {
         let sql = params::substitute(portal)?;
         let result = self
             .session
-            .execute(sql, principal_of(client))
+            .execute(sql)
             .await
-            .map_err(engine_error)?;
+            .map_err(|error| engine_error(&error))?;
         encode::to_response(
             &result.schema,
             &result.batches,
@@ -133,7 +139,7 @@ impl ExtendedQueryHandler for FedqBackend {
     /// to the client. No rows are read.
     async fn do_describe_statement<C>(
         &self,
-        client: &mut C,
+        _client: &mut C,
         target: &StoredStatement<Self::Statement>,
     ) -> PgWireResult<DescribeStatementResponse>
     where
@@ -145,9 +151,9 @@ impl ExtendedQueryHandler for FedqBackend {
         let sql = params::substitute_nulls(&target.statement, &target.parameter_types)?;
         let columns = self
             .session
-            .describe(sql, principal_of(client))
+            .describe(sql)
             .await
-            .map_err(engine_error)?;
+            .map_err(|error| engine_error(&error))?;
         let fields = encode::describe_fields(&columns)?;
         Ok(DescribeStatementResponse::new(
             declared_param_types(&target.parameter_types),
@@ -159,7 +165,7 @@ impl ExtendedQueryHandler for FedqBackend {
     /// with the bound parameter values spliced in. No rows are read.
     async fn do_describe_portal<C>(
         &self,
-        client: &mut C,
+        _client: &mut C,
         portal: &Portal<Self::Statement>,
     ) -> PgWireResult<DescribePortalResponse>
     where
@@ -171,9 +177,9 @@ impl ExtendedQueryHandler for FedqBackend {
         let sql = params::substitute(portal)?;
         let columns = self
             .session
-            .describe(sql, principal_of(client))
+            .describe(sql)
             .await
-            .map_err(engine_error)?;
+            .map_err(|error| engine_error(&error))?;
         let fields = encode::describe_fields(&columns)?;
         Ok(DescribePortalResponse::new(fields))
     }
@@ -195,10 +201,34 @@ fn declared_param_types(types: &[Option<Type>]) -> Vec<Type> {
 /// shared `ConnectionManager` and generates a backend key, so a cancel request can
 /// find and cancel this connection's running query exactly as under SCRAM.
 pub struct TrustStartup {
+    session: Arc<Session>,
     manager: Arc<ConnectionManager>,
 }
 
+#[async_trait]
 impl NoopStartupHandler for TrustStartup {
+    /// Validate the selected database and construct its runtime before ReadyForQuery.
+    async fn post_startup<C>(
+        &self,
+        client: &mut C,
+        _message: PgWireFrontendMessage,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let database = startup_database(client)?;
+        let username = LoginInfo::from_client_info(client)
+            .user()
+            .unwrap_or_default()
+            .to_string();
+        self.session
+            .initialize(database, SessionIdentity::Trusted(username))
+            .await
+            .map_err(|error| engine_error(&error))
+    }
+
     /// Registering the connection here is what lets a later CancelRequest resolve
     /// to this connection's cancel handle.
     fn connection_manager(&self) -> Option<Arc<ConnectionManager>> {
@@ -257,7 +287,8 @@ impl FedqHandlers {
         manager: Arc<ConnectionManager>,
         auth: Option<Arc<StoreAuthSource>>,
     ) -> Self {
-        let startup = build_startup(manager.clone(), auth);
+        let session = Arc::new(session);
+        let startup = build_startup(manager.clone(), auth, Arc::clone(&session));
         Self {
             backend: Arc::new(FedqBackend::new(session)),
             startup: Arc::new(startup),
@@ -273,10 +304,13 @@ impl FedqHandlers {
 fn build_startup(
     manager: Arc<ConnectionManager>,
     auth: Option<Arc<StoreAuthSource>>,
+    session: Arc<Session>,
 ) -> FedqStartup {
     match auth {
-        None => FedqStartup::Trust(TrustStartup { manager }),
-        Some(auth) => FedqStartup::Scram(Box::new(ScramStartupHandler::new(auth, manager))),
+        None => FedqStartup::Trust(TrustStartup { session, manager }),
+        Some(auth) => {
+            FedqStartup::Scram(Box::new(ScramStartupHandler::new(auth, manager, session)))
+        }
     }
 }
 
@@ -306,10 +340,17 @@ impl PgWireServerHandlers for FedqHandlers {
 /// Wrap an engine error message as a Postgres `ErrorResponse`. The engine's
 /// message is passed through unmodified, so an invalid query surfaces its real
 /// bind/parse cause instead of a laundered one.
-fn engine_error(message: String) -> PgWireError {
+pub(crate) fn engine_error(error: &SessionError) -> PgWireError {
+    let code = match error {
+        SessionError::Runtime(fq_runtime::RuntimeError::PermissionDenied(_)) => "42501",
+        SessionError::Runtime(fq_runtime::RuntimeError::CatalogStore(
+            fq_catalog::store::StoreError::DatabaseMissing(_),
+        )) => "3D000",
+        _ => "XX000",
+    };
     PgWireError::UserError(Box::new(ErrorInfo::new(
-        "ERROR".to_owned(),
-        "XX000".to_owned(),
-        message,
+        "ERROR".to_string(),
+        code.to_string(),
+        error.to_string(),
     )))
 }

@@ -584,28 +584,44 @@ fn grouped_limit_order(
 
 /// Render a constant VALUES relation to merge-engine SQL:
 /// `SELECT * FROM (VALUES (..),(..)) AS v("n0","n1")`. Ports `_render_values_sql`;
-/// a non-literal cell RAISES (`_values_cell`).
+/// bound constant expressions are evaluated by the coordinator.
 pub fn render_values_sql(rows: &[Vec<Expr>], names: &[String]) -> Result<String, StepError> {
     let mut tuples = Vec::with_capacity(rows.len());
     for row in rows {
         tuples.push(render_values_row(row)?);
     }
-    let columns = quote_names(names);
+    let aliases = values_column_aliases(names.len());
+    let columns = quote_names(&aliases);
+    let projection = values_projection(names, &aliases);
     let sql = format!(
-        "SELECT * FROM (VALUES {}) AS v({})",
+        "SELECT {projection} FROM (VALUES {}) AS v({columns})",
         tuples.join(", "),
-        columns
     );
     Ok(to_source_sql(&sql, Dialect::DataFusion)?)
 }
 
-/// One VALUES row rendered as `(c0, c1, ...)`; every cell must be a literal.
+/// Assign simple internal names to VALUES columns before dialect transformation.
+fn values_column_aliases(count: usize) -> Vec<String> {
+    let mut aliases = Vec::with_capacity(count);
+    for index in 0..count {
+        aliases.push(format!("__value_{index}"));
+    }
+    aliases
+}
+
+/// Expose each real VALUES column under its requested, explicitly quoted name.
+fn values_projection(names: &[String], aliases: &[String]) -> String {
+    let mut projection = Vec::with_capacity(names.len());
+    for (name, alias) in names.iter().zip(aliases) {
+        projection.push(format!("v.{} AS {}", quote_ident(alias), quote_ident(name)));
+    }
+    projection.join(", ")
+}
+
+/// Render one bound VALUES row without discarding casts or constant expressions.
 fn render_values_row(row: &[Expr]) -> Result<String, StepError> {
     let mut cells = Vec::with_capacity(row.len());
     for cell in row {
-        if !matches!(cell, Expr::Literal { .. }) {
-            return Err(StepError::NonLiteralValuesCell);
-        }
         cells.push(render_expr(cell, &SourceResolver)?);
     }
     Ok(format!("({})", cells.join(", ")))

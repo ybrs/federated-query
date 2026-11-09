@@ -1,5 +1,16 @@
 # Example configuration for federated query engine
 
+# Per-database storage. Defaults to <config-stem>.data beside this file.
+# The layout is <root>/server.sqlite plus databases/<database-id>/ holding
+# that database's metadata.sqlite, materialized/, and scratch/.
+storage:
+  root: /data/fedq
+
+# Authentication is explicit: trust (unauthenticated, development only) or
+# scram. Bootstrap credentials require auth: scram and a superuser.
+server:
+  auth: trust
+
 datasources:
   # PostgreSQL data source
   postgres_prod:

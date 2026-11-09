@@ -329,6 +329,14 @@ pub struct Values {
     pub output_names: Vec<String>,
 }
 
+/// Where a subquery scan's body came from: an inline derived table, or the
+/// expansion of a stored view whose identity authorization must check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubqueryOrigin {
+    Derived,
+    StoredView(fq_common::database::StoredRelationRef),
+}
+
 /// A derived table: a subplan exposed under an alias.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SubqueryScan {
@@ -336,6 +344,7 @@ pub struct SubqueryScan {
     pub alias: String,
     /// `AS alias(col, ...)` positional rename list; None keeps the subplan names.
     pub column_names: Option<Vec<String>>,
+    pub origin: SubqueryOrigin,
 }
 
 /// Runtime cardinality guard for decorrelated scalar subqueries: with no keys,

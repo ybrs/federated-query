@@ -33,6 +33,22 @@ pub trait Authorizer {
     /// datasource/schema/table are the table's REAL qualifier from the catalog,
     /// never the raw (possibly bare) scan reference.
     fn authorize_select(&self, datasource: &str, schema: &str, table: &str) -> bool;
+
+    /// Whether the principal may SELECT one stored relation by durable identity.
+    fn authorize_object(&self, object: &fq_common::security::ObjectKey) -> bool;
+}
+
+/// Bind all base-table and dataset references under one explicit query context.
+pub fn bind_in_context(
+    catalog: &Catalog,
+    plan: LogicalPlan,
+    superuser: bool,
+    authorizer: &dyn Authorizer,
+) -> Result<LogicalPlan, BindError> {
+    guard_depth(&plan)?;
+    let bound = Binder::with_principal(catalog, superuser, authorizer).bind(plan)?;
+    guard_depth(&bound)?;
+    Ok(bound)
 }
 
 /// Bind a logical plan against `catalog` with NO enforcement (an implicit

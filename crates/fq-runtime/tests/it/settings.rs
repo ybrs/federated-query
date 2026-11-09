@@ -17,6 +17,7 @@ use serde_yaml::Value;
 /// surface and constant `SELECT`s (no source data is needed).
 fn empty_config() -> Config {
     Config {
+        storage: fq_common::StorageConfig::default(),
         datasources: BTreeMap::new(),
         optimizer: OptimizerConfig::default(),
         executor: ExecutorConfig::default(),
@@ -366,7 +367,9 @@ fn record_star_ndvs(config: &Config) {
         .source_path
         .clone()
         .expect("stored config has a path");
-    let stats_path = std::path::Path::new(&source_path).with_file_name("config.stats.sqlite");
+    let stats_path =
+        super::storage::main_paths(&std::path::Path::new(&source_path).with_extension("data"))
+            .metadata;
     let learned =
         fq_catalog::StatsCatalog::open(&stats_path.to_string_lossy()).expect("open learned stats");
     for (table, column, ndv) in [

@@ -20,7 +20,8 @@ use fq_catalog::Catalog;
 use fq_plan::expr::{LiteralValue, NullsOrder};
 use fq_plan::{
     Aggregate, BinaryOpType, ColumnRef, Cte, CteRef, Expr, Filter, Join, JoinType, LateralJoin,
-    Limit, LogicalPlan, Projection, Scan, SetOpKind, SetOperation, Sort, SubqueryScan, Values,
+    Limit, LogicalPlan, Projection, Scan, SetOpKind, SetOperation, Sort, SubqueryOrigin,
+    SubqueryScan, Values,
 };
 use polyglot_sql::expressions::{
     Expression, JoinKind, Literal, Null, Ordered, Sample, SampleMethod, Select, TableRef, With,
@@ -690,6 +691,7 @@ impl Converter<'_> {
             input: Box::new(plan),
             alias,
             column_names: None,
+            origin: SubqueryOrigin::Derived,
         }))
     }
 
@@ -909,6 +911,10 @@ impl Converter<'_> {
             input: Box::new(input),
             alias: key.to_string(),
             column_names: view.column_aliases.clone(),
+            origin: match view.access {
+                Some(access) => SubqueryOrigin::StoredView(access),
+                None => SubqueryOrigin::Derived,
+            },
         }))
     }
 
@@ -986,6 +992,7 @@ impl Converter<'_> {
             input: Box::new(input),
             alias,
             column_names: rename,
+            origin: SubqueryOrigin::Derived,
         }))
     }
 
@@ -1418,6 +1425,7 @@ impl Converter<'_> {
             input: Box::new(input),
             alias: QUALIFY_SUBQUERY_ALIAS.to_string(),
             column_names: None,
+            origin: SubqueryOrigin::Derived,
         });
         // Fresh QUALIFY filter over the subquery - no base to copy from. Field list
         // (input/predicate) is the complete Filter struct.

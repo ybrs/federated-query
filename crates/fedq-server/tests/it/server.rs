@@ -73,6 +73,7 @@ fn shop_config(path: &str, server: ServerConfig) -> Config {
         },
     );
     Config {
+        storage: fq_common::StorageConfig::default(),
         datasources,
         optimizer: OptimizerConfig::default(),
         executor: ExecutorConfig::default(),
@@ -99,7 +100,7 @@ async fn start_server(config: Config) -> u16 {
 /// Connect a Postgres client to `port` with the given connection string suffix
 /// (user, and optionally password), spawning its connection driver task.
 async fn connect(port: u16, credentials: &str) -> Result<Client, tokio_postgres::Error> {
-    let conn_str = format!("host=127.0.0.1 port={port} dbname=fedq {credentials}");
+    let conn_str = format!("host=127.0.0.1 port={port} dbname=main {credentials}");
     let (client, connection) = tokio_postgres::connect(&conn_str, NoTls).await?;
     tokio::spawn(async move {
         let _ = connection.await;
@@ -318,6 +319,7 @@ async fn start_scram_server(users: Vec<UserCredential>) -> u16 {
     start_server(shop_config(
         &path,
         ServerConfig {
+            auth: fq_common::security::AuthMode::Scram,
             users,
             ..ServerConfig::default()
         },

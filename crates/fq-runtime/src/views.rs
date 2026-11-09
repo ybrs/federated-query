@@ -13,7 +13,6 @@ use std::sync::Arc;
 
 use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema, SchemaRef};
-use fq_accel::StoredView;
 use fq_catalog::ViewDef;
 use fq_common::DataType;
 
@@ -31,7 +30,7 @@ impl Runtime {
         select_sql: &str,
         or_replace: bool,
     ) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
-        let accel = self.accelerator()?;
+        let definitions = self.database_catalog()?;
         let catalog = self.catalog_snapshot();
         let exists = catalog.get_view(name).is_some();
         if exists && !or_replace {
@@ -40,26 +39,21 @@ impl Runtime {
             )));
         }
         if !exists {
-            if let Some(holder) = self.relation_name_holder(name) {
+            if let Some(holder) = self.relation_name_holder(name)? {
                 return Err(RuntimeError::View(format!(
                     "relation '{name}' already exists ({holder}); a view cannot shadow it"
                 )));
             }
         }
         self.validate_view_definition(name, column_aliases.as_deref(), select_sql)?;
-        // `created_at` is stamped by the catalog's clock on write; the value
-        // passed here is not read.
-        accel.upsert_view(&StoredView {
-            name: name.to_string(),
-            definition_sql: select_sql.to_string(),
-            column_aliases: column_aliases.clone(),
-            created_at: String::new(),
-        })?;
+        let relation =
+            definitions.upsert_view(name, select_sql, column_aliases.as_deref(), &self.actor())?;
         self.install_view(
             name,
             ViewDef {
                 sql: select_sql.to_string(),
                 column_aliases,
+                access: self.view_access(relation.id),
             },
         );
         status_result(if or_replace {
@@ -84,10 +78,11 @@ impl Runtime {
             ViewDef {
                 sql: select_sql.to_string(),
                 column_aliases: column_aliases.map(<[String]>::to_vec),
+                access: None,
             },
         );
         let plan = fq_parse::parse_with_catalog(select_sql, &probe)?;
-        let bound = fq_bind::bind(&probe, plan)?;
+        let bound = self.bind_with_authz(&probe, plan)?;
         if let Some(renames) = column_aliases {
             let produced = bound.schema().len();
             if renames.len() != produced {
@@ -106,8 +101,8 @@ impl Runtime {
         &self,
         name: &str,
     ) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
-        let accel = self.accelerator()?;
-        if !accel.delete_view(name)? {
+        let definitions = self.database_catalog()?;
+        if !definitions.delete_view(name)? {
             return Err(RuntimeError::View(format!("view '{name}' does not exist")));
         }
         let mut next = (*self.catalog_snapshot()).clone();
@@ -118,7 +113,7 @@ impl Runtime {
 
     /// `SHOW VIEWS`: every registered view with its definition.
     pub(crate) fn show_views(&self) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
-        let views = self.accelerator()?.list_views()?;
+        let views = self.database_catalog()?.list_views()?;
         let schema = Arc::new(Schema::new(vec![
             Field::new("name", ArrowDataType::Utf8, false),
             Field::new("columns", ArrowDataType::Utf8, true),
@@ -148,6 +143,19 @@ impl Runtime {
         Ok((schema, vec![batch]))
     }
 
+    /// The access identity a view reference in this database must authorize.
+    fn view_access(
+        &self,
+        relation: fq_common::database::RelationId,
+    ) -> Option<fq_common::database::StoredRelationRef> {
+        self.database_lease
+            .as_deref()
+            .map(|lease| fq_common::database::StoredRelationRef {
+                database: lease.descriptor.id,
+                relation,
+            })
+    }
+
     /// Register one view in a fresh catalog snapshot and swap it in.
     fn install_view(&self, name: &str, view: ViewDef) {
         let mut next = (*self.catalog_snapshot()).clone();
@@ -170,14 +178,19 @@ pub(crate) fn views_describe_columns() -> Vec<(String, DataType)> {
 /// the same config still resolves them.
 pub(crate) fn install_persisted_views(
     catalog: &mut fq_catalog::Catalog,
-    accel: &fq_accel::Accelerator,
+    definitions: &fq_catalog::store::DatabaseCatalog,
+    database: Option<fq_common::database::DatabaseId>,
 ) -> Result<(), RuntimeError> {
-    for view in accel.list_views()? {
+    for view in definitions.list_views()? {
         catalog.register_view(
-            view.name,
+            view.name.clone(),
             ViewDef {
                 sql: view.definition_sql,
                 column_aliases: view.column_aliases,
+                access: database.map(|database| fq_common::database::StoredRelationRef {
+                    database,
+                    relation: view.relation_id,
+                }),
             },
         );
     }

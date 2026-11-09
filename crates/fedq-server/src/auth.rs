@@ -15,16 +15,20 @@ use std::sync::Arc;
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
 
-use fq_accel::Accelerator;
+use fq_catalog::store::ServerCatalog;
 use fq_common::UserCredential;
 use fq_scram::Verifier;
+use pgwire::error::{PgWireError, PgWireResult};
 
-/// The verifier source the vendored SCRAM handshake queries: the persisted
-/// `users` table, with a mock verifier for unknown users. It holds the store, the
-/// iteration count NEW mock salts advertise, and a per-server random secret the
-/// mock verifier is derived from (never persisted to a client-visible place).
+/// A credential carries the stable identity captured alongside its verifier.
+pub struct AuthCredential {
+    pub verifier: Verifier,
+    pub principal: Option<fq_common::database::PrincipalId>,
+}
+
+/// Server-owned credential lookup with deterministic unknown-user mocks.
 pub struct StoreAuthSource {
-    store: Arc<Accelerator>,
+    store: Arc<ServerCatalog>,
     iterations: u32,
     mock_secret: Vec<u8>,
 }
@@ -32,7 +36,7 @@ pub struct StoreAuthSource {
 impl StoreAuthSource {
     /// Build the source over the shared store, with a fresh per-server mock
     /// secret generated at startup.
-    pub fn new(store: Arc<Accelerator>, iterations: u32) -> Self {
+    pub fn new(store: Arc<ServerCatalog>, iterations: u32) -> Self {
         Self {
             store,
             iterations,
@@ -40,18 +44,24 @@ impl StoreAuthSource {
         }
     }
 
-    /// The verifier to check `username`'s login against: the stored verifier, or a
-    /// deterministic mock for an unknown user (or an unreadable/malformed stored
-    /// verifier). The handshake runs its full proof check either way, failing at
-    /// the end exactly as a wrong password does, so "no such user" is
-    /// indistinguishable from "wrong password".
-    pub fn verifier_for(&self, username: &str) -> Verifier {
-        if let Ok(Some(user)) = self.store.get_user(username) {
-            if let Ok(verifier) = Verifier::parse(&user.verifier) {
-                return verifier;
-            }
+    /// Look up a real verifier or an unknown user's deterministic mock.
+    /// Metadata failures and malformed stored verifiers propagate unchanged.
+    pub fn credential_for(&self, username: &str) -> PgWireResult<AuthCredential> {
+        let user = self
+            .store
+            .get_user(username)
+            .map_err(|error| PgWireError::ApiError(Box::new(error)))?;
+        match user {
+            Some(user) => Ok(AuthCredential {
+                verifier: Verifier::parse(&user.verifier)
+                    .map_err(|error| PgWireError::ApiError(Box::new(error)))?,
+                principal: Some(user.id),
+            }),
+            None => Ok(AuthCredential {
+                verifier: fq_scram::mock_verifier(username, &self.mock_secret, self.iterations),
+                principal: None,
+            }),
         }
-        fq_scram::mock_verifier(username, &self.mock_secret, self.iterations)
     }
 }
 
@@ -177,5 +187,66 @@ mod tests {
             &mut out,
         );
         out.to_vec()
+    }
+    /// Allocate a standalone identity store for a credential-lookup regression.
+    fn identity_store(tag: &str) -> Arc<ServerCatalog> {
+        let dir = std::env::temp_dir().join(format!("fq_auth_{tag}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create identity directory");
+        let path = dir.join("identities.sqlite");
+        Arc::new(ServerCatalog::open(&path.to_string_lossy()).expect("open identities"))
+    }
+
+    /// A missing identity uses the mock proof path without opening data stores.
+    #[test]
+    fn unknown_user_gets_a_mock_verifier() {
+        let source = StoreAuthSource::new(identity_store("unknown"), 4096);
+        assert!(source
+            .credential_for("unknown")
+            .expect("mock")
+            .principal
+            .is_none());
+    }
+
+    /// A verified credential keeps the identity that existed at the first SCRAM lookup.
+    #[test]
+    fn credential_capture_does_not_follow_username_recreation() {
+        let store = identity_store("captured");
+        let verifier = hash_password("alice", "pw", false, 4096)
+            .expect("hash")
+            .verifier;
+        store
+            .create_user("alice", &verifier, false, "test")
+            .expect("create");
+        let source = StoreAuthSource::new(Arc::clone(&store), 4096);
+        let captured = source.credential_for("alice").expect("lookup");
+        store.drop_user("alice").expect("drop");
+        store
+            .create_user("alice", &verifier, false, "test")
+            .expect("recreate");
+        assert_ne!(
+            captured.principal,
+            source
+                .credential_for("alice")
+                .expect("new credential")
+                .principal
+        );
+        assert!(store
+            .get_user_by_id(captured.principal.expect("real identity"))
+            .expect("old identity")
+            .is_none());
+    }
+
+    /// Invalid stored credentials surface their parse failure rather than a mock.
+    #[test]
+    fn malformed_stored_verifier_raises() {
+        let store = identity_store("malformed");
+        store
+            .create_user("broken", "invalid-verifier", false, "test")
+            .expect("seed");
+        let source = StoreAuthSource::new(store, 4096);
+        assert!(matches!(
+            source.credential_for("broken"),
+            Err(PgWireError::ApiError(_))
+        ));
     }
 }

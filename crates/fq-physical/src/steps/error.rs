@@ -36,10 +36,6 @@ pub enum StepError {
     #[error("reduced join probe lost its injection base")]
     LostInjectionBase,
 
-    /// A VALUES cell that is not a constant literal.
-    #[error("non-literal VALUES cell is not supported")]
-    NonLiteralValuesCell,
-
     /// A scan's SELECT list contains a `*` - a star must never survive into a bound
     /// scan (the binder expands it), so a star here is a loud raise.
     #[error("a '*' must never appear in a bound scan's columns")]

@@ -33,21 +33,15 @@ pub struct Runtime {
 
 #[pymethods]
 impl Runtime {
-    /// Build a runtime from a YAML config file PATH.
-    ///
-    /// A path (not a dict) is the whole constructor surface: it is the exact
-    /// form `fq_common::load_config` consumes, it keeps the loudness of the
-    /// config loader (unknown section / malformed datasource raise here), and
-    /// the harness already writes a temporary YAML. Loading the config and
-    /// wiring every datasource (metadata + the exec data plane) both happen
-    /// now, so a bad config or an unreachable source fails at construction.
+    /// Build a runtime over one selected database from a validated YAML config.
     #[new]
-    fn new(config_path: &str) -> PyResult<Self> {
+    #[pyo3(signature = (config_path, database="main"))]
+    fn new(config_path: &str, database: &str) -> PyResult<Self> {
         let config = load_config(config_path).map_err(|error| {
             PyRuntimeError::new_err(format!("failed to load config '{config_path}': {error}"))
         })?;
-        let inner =
-            EngineRuntime::from_config(&config).map_err(|error| runtime_error_to_py(&error))?;
+        let inner = EngineRuntime::from_config_in_database(&config, database)
+            .map_err(|error| runtime_error_to_py(&error))?;
         Ok(Self { inner })
     }
 

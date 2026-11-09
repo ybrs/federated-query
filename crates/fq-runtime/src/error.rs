@@ -18,6 +18,21 @@ use thiserror::Error;
 /// Every way `Runtime::from_config` or `Runtime::execute` can fail.
 #[derive(Debug, Error)]
 pub enum RuntimeError {
+    /// A malformed SCRAM verifier or hashing parameter failed native validation.
+    #[error(transparent)]
+    Credential(#[from] fq_scram::ScramError),
+    /// Typed configuration validation failures propagate without message rewriting.
+    #[error(transparent)]
+    ConfigValidation(#[from] fq_common::ConfigError),
+    /// A filesystem operation failed at its native IO boundary.
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    /// An active runtime holds the database's shared lifecycle lease.
+    #[error("database '{0}' is in use")]
+    DatabaseInUse(String),
+    /// A durable identity or database catalog operation failed.
+    #[error(transparent)]
+    CatalogStore(#[from] fq_catalog::store::StoreError),
     /// A datasource block is missing a required parameter, or names a source
     /// kind the runtime does not build. Surfaced from `from_config`.
     #[error("configuration error: {0}")]

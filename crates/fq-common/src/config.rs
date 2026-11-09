@@ -7,8 +7,9 @@
 //! defaults come from each struct's `Default` (via `#[serde(default)]`), so a
 //! missing key falls back exactly as the Python defaults did.
 
+use crate::security::AuthMode;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -18,7 +19,7 @@ use crate::error::ConfigError;
 
 /// The top-level sections `load_config` recognizes. Anything else is a typo and
 /// raises (`config.py`'s `known_sections`).
-const KNOWN_SECTIONS: [&str; 8] = [
+const KNOWN_SECTIONS: [&str; 9] = [
     "datasources",
     "optimizer",
     "executor",
@@ -27,6 +28,7 @@ const KNOWN_SECTIONS: [&str; 8] = [
     "accelerator",
     "catalog",
     "diagnostics",
+    "storage",
 ];
 
 /// Configuration for a single data source.
@@ -36,7 +38,8 @@ const KNOWN_SECTIONS: [&str; 8] = [
 /// `type`, `capabilities`, or `change_keys`), preserved as raw YAML values.
 /// `change_keys` declares, per `schema.table`, how the table changes; REFRESH
 /// MATERIALIZED VIEW uses it to pull deltas instead of whole re-pulls.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DataSourceConfig {
     pub name: String,
     pub ty: String,
@@ -60,7 +63,7 @@ pub struct DataSourceConfig {
 /// Exactly one of the two forms per table; declaring both raises at load
 /// (a watermarked merge cannot see deletes, so the combination would ship a
 /// deleted row as current).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ChangeKey {
     /// Monotonic column: delta refresh appends rows past the watermark.
     Monotonic { column: String },
@@ -301,6 +304,7 @@ impl Default for CatalogConfig {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ServerConfig {
+    pub auth: AuthMode,
     pub users: Vec<UserCredential>,
     pub scram_iterations: u32,
 }
@@ -310,6 +314,7 @@ impl Default for ServerConfig {
     /// a single-tenant trust deployment until users are configured.
     fn default() -> Self {
         Self {
+            auth: AuthMode::Trust,
             users: Vec::new(),
             scram_iterations: SCRAM_ITERATIONS,
         }
@@ -389,6 +394,7 @@ impl Principal {
 /// a programmatically built config.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Config {
+    pub storage: StorageConfig,
     pub datasources: BTreeMap<String, DataSourceConfig>,
     pub optimizer: OptimizerConfig,
     pub executor: ExecutorConfig,
@@ -417,10 +423,9 @@ pub fn load_config(config_path: &str) -> Result<Config, ConfigError> {
     reject_unknown_sections(mapping)?;
 
     let server: ServerConfig = parse_section(mapping, "server")?;
-    if server.scram_iterations < SCRAM_ITERATIONS {
-        return Err(ConfigError::ScramIterationsTooLow(server.scram_iterations));
-    }
+    server.validate()?;
     Ok(Config {
+        storage: parse_section(mapping, "storage")?,
         datasources: parse_datasources(mapping)?,
         optimizer: parse_section(mapping, "optimizer")?,
         executor: parse_section(mapping, "executor")?,
@@ -685,4 +690,55 @@ fn parse_capabilities(name: &str, value: &Value) -> Result<Vec<String>, ConfigEr
         capabilities.push(text.to_string());
     }
     Ok(capabilities)
+}
+
+/// The durable storage root; file-loaded configs derive a sibling when absent.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct StorageConfig {
+    pub root: Option<PathBuf>,
+}
+
+impl StorageConfig {
+    /// Resolve the root without requiring the destination directory to exist.
+    pub fn resolve(&self, config_path: Option<&str>) -> std::io::Result<Option<PathBuf>> {
+        let path = match &self.root {
+            Some(root) => Some(resolve_storage_root(root, config_path)),
+            None => config_path.map(default_storage_root),
+        };
+        path.map(std::path::absolute).transpose()
+    }
+}
+
+/// Resolve a configured relative root against its configuration directory.
+fn resolve_storage_root(root: &Path, config_path: Option<&str>) -> PathBuf {
+    if root.is_absolute() {
+        return root.to_path_buf();
+    }
+    let parent = config_path.and_then(|path| Path::new(path).parent());
+    parent.unwrap_or_else(|| Path::new(".")).join(root)
+}
+
+/// Derive a storage directory from the config stem without interpreting SQL names.
+fn default_storage_root(config_path: &str) -> PathBuf {
+    let path = Path::new(config_path);
+    let mut stem = path
+        .file_stem()
+        .unwrap_or_else(|| std::ffi::OsStr::new("fedq"))
+        .to_os_string();
+    stem.push(".data");
+    path.with_file_name(stem)
+}
+
+impl ServerConfig {
+    /// Reject weakened SCRAM parameters and ambiguous trust credentials.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.scram_iterations < SCRAM_ITERATIONS {
+            return Err(ConfigError::ScramIterationsTooLow(self.scram_iterations));
+        }
+        if self.auth == AuthMode::Trust && !self.users.is_empty() {
+            return Err(ConfigError::BootstrapUsersWithTrust);
+        }
+        Ok(())
+    }
 }

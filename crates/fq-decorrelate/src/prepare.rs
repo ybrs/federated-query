@@ -11,7 +11,8 @@ use std::collections::{HashMap, HashSet};
 use fq_common::DataType;
 use fq_plan::expr::{column_refs, BinaryOpType, ColumnRef, Expr, LiteralValue, NullsOrder};
 use fq_plan::logical::{
-    Aggregate, Filter, Limit, LogicalPlan, Projection, SingleRowGuard, Sort, SubqueryScan,
+    Aggregate, Filter, Limit, LogicalPlan, Projection, SingleRowGuard, Sort, SubqueryOrigin,
+    SubqueryScan,
 };
 
 use crate::error::DecorrelationError;
@@ -135,6 +136,7 @@ impl<'a> SubqueryPreparer<'a> {
             input: Box::new(prepared.plan),
             alias: self.prefix.clone(),
             column_names: None,
+            origin: SubqueryOrigin::Derived,
         });
         prepared
     }
@@ -837,6 +839,7 @@ impl SubqueryPreparer<'_> {
                 input: Box::new(guarded),
                 alias: self.prefix.clone(),
                 column_names: None,
+                origin: SubqueryOrigin::Derived,
             }),
             condition,
             replacement,

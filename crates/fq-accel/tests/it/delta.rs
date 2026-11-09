@@ -20,7 +20,12 @@ fn small_chunk_accel(tag: &str) -> Accelerator {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("create sandbox");
     let config: PathBuf = dir.join("config.yaml");
-    Accelerator::open_with_chunk_bytes(&config, Some(1)).expect("open")
+    Accelerator::open_with_chunk_bytes(
+        &config.with_extension("sqlite"),
+        &config.with_extension("mv"),
+        Some(1),
+    )
+    .expect("open")
 }
 
 /// The (k BIGINT, v TEXT) schema.
@@ -348,7 +353,12 @@ fn tokens_and_state_survive_a_reopen() {
     std::fs::create_dir_all(&dir).expect("create sandbox");
     let config = dir.join("config.yaml");
     {
-        let accel = Accelerator::open_with_chunk_bytes(&config, Some(1)).expect("open");
+        let accel = Accelerator::open_with_chunk_bytes(
+            &config.with_extension("sqlite"),
+            &config.with_extension("mv"),
+            Some(1),
+        )
+        .expect("open");
         accel
             .create_view(
                 "mv",
@@ -363,7 +373,11 @@ fn tokens_and_state_survive_a_reopen() {
             )
             .expect("create");
     }
-    let accel = Accelerator::open(&config).expect("reopen");
+    let accel = Accelerator::open(
+        &config.with_extension("sqlite"),
+        &config.with_extension("mv"),
+    )
+    .expect("reopen");
     let view = accel.view("mv").expect("view");
     assert_eq!(view.source_tokens, tokens("t0"));
     assert_eq!(

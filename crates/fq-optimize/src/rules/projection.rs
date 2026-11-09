@@ -532,7 +532,7 @@ mod tests {
     use super::*;
     use fq_common::DataType;
     use fq_plan::expr::{BinaryOpType, ColumnRef, LiteralValue};
-    use fq_plan::logical::{Filter, Join, JoinType, Projection};
+    use fq_plan::logical::{Filter, Join, JoinType, Projection, SubqueryOrigin};
 
     /// A scan reading `columns` from `table`, aliased to `table`.
     fn scan(table: &str, columns: &[&str]) -> LogicalPlan {
@@ -887,6 +887,7 @@ mod tests {
                 "z2".to_string(),
                 "f2".to_string(),
             ]),
+            origin: SubqueryOrigin::Derived,
         });
         let root = LogicalPlan::Projection(Projection {
             input: Box::new(LogicalPlan::Filter(Filter {

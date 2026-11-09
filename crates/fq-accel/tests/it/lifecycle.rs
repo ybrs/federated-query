@@ -49,7 +49,11 @@ fn batch(rows: &[(i64, &str)]) -> RecordBatch {
 #[test]
 fn create_registers_and_persists_readable_chunks() {
     let config = sandbox("create");
-    let accel = Accelerator::open(&config).expect("open");
+    let accel = Accelerator::open(
+        &config.with_extension("sqlite"),
+        &config.with_extension("mv"),
+    )
+    .expect("open");
     let data = batch(&[(1, "a"), (2, "b")]);
     let view = accel
         .create_view(
@@ -75,7 +79,11 @@ fn create_registers_and_persists_readable_chunks() {
 #[test]
 fn duplicate_create_raises_and_leaves_no_orphan_chunks() {
     let config = sandbox("dup");
-    let accel = Accelerator::open(&config).expect("open");
+    let accel = Accelerator::open(
+        &config.with_extension("sqlite"),
+        &config.with_extension("mv"),
+    )
+    .expect("open");
     accel
         .create_view(
             "mv",
@@ -107,7 +115,11 @@ fn duplicate_create_raises_and_leaves_no_orphan_chunks() {
 #[test]
 fn refresh_swaps_generations_and_unlinks_the_old_files() {
     let config = sandbox("refresh");
-    let accel = Accelerator::open(&config).expect("open");
+    let accel = Accelerator::open(
+        &config.with_extension("sqlite"),
+        &config.with_extension("mv"),
+    )
+    .expect("open");
     let created = accel
         .create_view(
             "mv",
@@ -140,7 +152,11 @@ fn refresh_swaps_generations_and_unlinks_the_old_files() {
 #[test]
 fn refresh_with_a_drifted_schema_raises_and_keeps_the_view() {
     let config = sandbox("drift");
-    let accel = Accelerator::open(&config).expect("open");
+    let accel = Accelerator::open(
+        &config.with_extension("sqlite"),
+        &config.with_extension("mv"),
+    )
+    .expect("open");
     accel
         .create_view(
             "mv",
@@ -175,7 +191,11 @@ fn refresh_with_a_drifted_schema_raises_and_keeps_the_view() {
 #[test]
 fn drop_removes_the_row_and_the_files() {
     let config = sandbox("drop");
-    let accel = Accelerator::open(&config).expect("open");
+    let accel = Accelerator::open(
+        &config.with_extension("sqlite"),
+        &config.with_extension("mv"),
+    )
+    .expect("open");
     let view = accel
         .create_view(
             "mv",
@@ -203,7 +223,11 @@ fn drop_removes_the_row_and_the_files() {
 fn reopen_sees_the_registered_views() {
     let config = sandbox("reopen");
     {
-        let accel = Accelerator::open(&config).expect("open");
+        let accel = Accelerator::open(
+            &config.with_extension("sqlite"),
+            &config.with_extension("mv"),
+        )
+        .expect("open");
         accel
             .create_view(
                 "mv",
@@ -215,7 +239,11 @@ fn reopen_sees_the_registered_views() {
             )
             .expect("create");
     }
-    let accel = Accelerator::open(&config).expect("reopen");
+    let accel = Accelerator::open(
+        &config.with_extension("sqlite"),
+        &config.with_extension("mv"),
+    )
+    .expect("reopen");
     let view = accel.view("mv").expect("durable view");
     assert_eq!(view.measured_rows, 1);
     assert_eq!(view.definition_sql, "SELECT k, v FROM t");
@@ -226,7 +254,11 @@ fn distinct_view_names_never_collide_on_chunk_keys() {
     // Two names that sanitize to the same directory stem still get distinct
     // directories (the name hash), so their chunks never mix.
     let config = sandbox("collide");
-    let accel = Accelerator::open(&config).expect("open");
+    let accel = Accelerator::open(
+        &config.with_extension("sqlite"),
+        &config.with_extension("mv"),
+    )
+    .expect("open");
     let a = accel
         .create_view(
             "a b",

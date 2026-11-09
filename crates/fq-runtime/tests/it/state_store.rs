@@ -61,6 +61,7 @@ fn config_for(dir: &Path, file: &Path) -> Config {
         },
     );
     Config {
+        storage: fq_common::StorageConfig::default(),
         datasources,
         optimizer: OptimizerConfig::default(),
         executor: ExecutorConfig::default(),
@@ -75,7 +76,7 @@ fn config_for(dir: &Path, file: &Path) -> Config {
 
 /// The state store path a config derives: `<config-stem>.stats.sqlite`.
 fn store_path(dir: &Path) -> PathBuf {
-    dir.join("config.stats.sqlite")
+    super::storage::main_paths(&dir.join("config.data")).metadata
 }
 
 /// Build a runtime over a fresh sandbox and prove it serves a query, returning
@@ -201,11 +202,14 @@ fn a_fresh_config_with_no_store_yet_still_works() {
     let dir = sandbox("fresh");
     let fixture = dir.join("fixture.parquet");
     write_fixture(&fixture);
-    let store = store_path(&dir);
-    assert!(!store.exists(), "no store exists before the first runtime");
+    assert!(
+        !dir.join("config.data").exists(),
+        "no root exists before the first runtime"
+    );
 
     let runtime = Runtime::from_config(&config_for(&dir, &fixture))
         .expect("a config with no store yet builds");
+    let store = store_path(&dir);
     let (_, batches) = runtime
         .execute("SELECT count(*) AS n FROM src.main.src")
         .expect("and serves queries");

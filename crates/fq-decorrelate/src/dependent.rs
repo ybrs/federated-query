@@ -27,7 +27,8 @@ use fq_plan::expr::{
     column_refs, split_conjuncts, BinaryOpType, ColumnRef, Expr, LiteralValue, NullsOrder,
 };
 use fq_plan::logical::{
-    Aggregate, Filter, Join, JoinType, LateralJoin, LogicalPlan, Projection, SubqueryScan,
+    Aggregate, Filter, Join, JoinType, LateralJoin, LogicalPlan, Projection, SubqueryOrigin,
+    SubqueryScan,
 };
 
 use crate::error::DecorrelationError;
@@ -889,5 +890,6 @@ fn aliased(input: LogicalPlan, alias: &str) -> LogicalPlan {
         input: Box::new(input),
         alias: alias.to_string(),
         column_names: None,
+        origin: SubqueryOrigin::Derived,
     })
 }

@@ -8,8 +8,11 @@ use thiserror::Error;
 /// invalid query MUST raise" rule: a bogus qualifier, a typo'd column, an
 /// ambiguous name, or a set-operation arity mismatch fails here, before any
 /// source is touched - never returns rows for a query it could not resolve.
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Error)]
 pub enum BindError {
+    /// Invalid stored metadata propagates with its native underlying cause.
+    #[error(transparent)]
+    CatalogStore(#[from] fq_catalog::store::StoreError),
     /// A table reference the catalog does not know.
     #[error("Table not found: {0}")]
     TableNotFound(String),

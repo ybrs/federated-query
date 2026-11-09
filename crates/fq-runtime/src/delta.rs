@@ -87,12 +87,17 @@ pub(crate) fn classify(
 ) -> Result<RefreshPlan, RuntimeError> {
     let parsed = fq_parse::parse_with_catalog(definition_sql, catalog)?;
     let bound = fq_bind::bind(catalog, parsed)?;
-    let base_tables = collect_base_tables(&bound);
-    let decision = decide(config, &bound, &base_tables);
-    Ok(RefreshPlan {
+    Ok(classify_bound(config, &bound))
+}
+
+/// Classify one already-bound definition: its base tables and pull decision.
+pub(crate) fn classify_bound(config: &Config, bound: &LogicalPlan) -> RefreshPlan {
+    let base_tables = collect_base_tables(bound);
+    let decision = decide(config, bound, &base_tables);
+    RefreshPlan {
         base_tables,
         decision,
-    })
+    }
 }
 
 /// The pull decision for a bound definition plan.
@@ -532,6 +537,7 @@ mod tests {
             },
         );
         Config {
+            storage: fq_common::StorageConfig::default(),
             datasources,
             optimizer: OptimizerConfig::default(),
             executor: ExecutorConfig::default(),

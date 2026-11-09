@@ -51,6 +51,7 @@ fn config(path: &str) -> Config {
         },
     );
     Config {
+        storage: fq_common::StorageConfig::default(),
         datasources,
         optimizer: fq_common::OptimizerConfig::default(),
         executor: fq_common::ExecutorConfig::default(),

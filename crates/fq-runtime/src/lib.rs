@@ -11,6 +11,8 @@
 //! This crate is pyo3-FREE. The `fedq-py` crate wraps it behind the Python FFI.
 
 mod acl;
+mod database_storage;
+mod databases;
 mod delta;
 mod dynamic_catalog;
 pub mod error;
@@ -18,12 +20,15 @@ mod explain;
 mod fragments;
 mod introspect;
 mod materialized;
+mod relations;
 mod settings;
 mod state_store;
 mod substitute;
 mod views;
 
 pub use acl::{import_bootstrap_users, require_a_superuser};
+pub use database_storage::{DatabaseLease, DatabaseManager};
+pub use databases::open_server_catalog;
 
 use std::cell::RefCell;
 use std::collections::BTreeSet;
@@ -36,6 +41,7 @@ use arrow::datatypes::{DataType as ArrowDataType, Field, Schema, SchemaRef};
 use serde_yaml::Value;
 
 use fq_accel::Accelerator;
+use fq_catalog::store::{DatabaseCatalog, ServerCatalog};
 use fq_catalog::{Catalog, StatsCatalog};
 use fq_common::{Config, DataSourceConfig, DataType, PlanBudget};
 use fq_connectors::{ClickHouseSource, DuckDbSource, MySqlSource, ParquetSource, PostgresSource};
@@ -96,6 +102,10 @@ pub struct Runtime {
     /// The materialized-view store, present when the config has a file path
     /// (the store lives next to it). DDL against a path-less config raises.
     accelerator: Option<Accelerator>,
+    /// Durable identities and grants, independent of materialized results.
+    server_catalog: Option<Arc<ServerCatalog>>,
+    /// Durable datasource, SQL-view, and setting definitions.
+    database_catalog: Option<DatabaseCatalog>,
     /// The live authorization state: the principal, its effective superuser
     /// flag, and the generation-gated grant cache. Embedded/trust builds hold an
     /// implicit superuser with enforcement off; a wire connection calls
@@ -106,6 +116,39 @@ pub struct Runtime {
     /// replaced, or stopped being a database POISONS the runtime, which then
     /// serves nothing further.
     state_store: state_store::StateStore,
+    /// The local catalog generation the live catalog snapshot was built from.
+    catalog_generation: RwLock<i64>,
+    /// The manager names the root metadata used by this session.
+    database_manager: Option<DatabaseManager>,
+    /// Held last so every database handle closes before its lifecycle lease.
+    database_lease: Option<Arc<DatabaseLease>>,
+}
+
+/// A data-plane session under construction: prunes every registration made
+/// under it unless construction finishes and defuses it into the Runtime.
+/// Without this, a construction failure after `open_session` would leak
+/// registry entries and pooled connections for the whole process.
+struct SessionGuard(Option<connectors::SessionId>);
+
+impl SessionGuard {
+    /// The session id registrations are made under during construction.
+    fn id(&self) -> connectors::SessionId {
+        self.0.expect("session guard used after defuse")
+    }
+
+    /// Hand the session to the finished Runtime, which prunes it on drop.
+    fn defuse(mut self) -> connectors::SessionId {
+        self.0.take().expect("session guard defused twice")
+    }
+}
+
+impl Drop for SessionGuard {
+    /// Prune a session whose Runtime was never constructed.
+    fn drop(&mut self) {
+        if let Some(session) = self.0 {
+            connectors::prune_session(session);
+        }
+    }
 }
 
 impl Runtime {
@@ -117,60 +160,78 @@ impl Runtime {
     /// and the exec read handle coexist on the same file for the whole session
     /// (DuckDB is single-writer per file per process).
     pub fn from_config(config: &Config) -> Result<Self, RuntimeError> {
+        Self::from_config_in_database(config, "main")
+    }
+
+    /// Construct one runtime bound to the explicitly selected database.
+    pub fn from_config_in_database(config: &Config, database: &str) -> Result<Self, RuntimeError> {
+        Self::from_config_context(config, database, None)
+    }
+
+    /// Construct a wire runtime using the stable identity proven by authentication.
+    pub fn from_config_authenticated(
+        config: &Config,
+        database: &str,
+        principal: fq_common::database::PrincipalId,
+    ) -> Result<Self, RuntimeError> {
+        Self::from_config_context(config, database, Some(principal))
+    }
+
+    /// Acquire the fixed database lease and authorize admission before opening any source.
+    fn from_config_context(
+        config: &Config,
+        database: &str,
+        principal: Option<fq_common::database::PrincipalId>,
+    ) -> Result<Self, RuntimeError> {
+        config.server.validate()?;
+        let database_manager = databases::open_manager(config)?;
+        let database_lease = databases::acquire_database(database_manager.as_ref(), database)?;
+        if let Some(principal) = principal {
+            databases::authorize_admission(
+                database_manager.as_ref(),
+                database_lease.as_deref(),
+                principal,
+            )?;
+        }
+        let mut effective = config.clone();
+        if database != "main" {
+            effective.datasources.clear();
+        }
+        let config = &effective;
         // The process-wide execution runtime is built (or checked) FIRST, so
         // `executor.max_threads` is honored before any query can run and a
         // config whose bound disagrees with the already-built runtime fails
         // construction loudly instead of executing under someone else's bound.
         fq_exec::ensure_exec_runtime(config.executor.max_threads as usize)
             .map_err(RuntimeError::Config)?;
-        let session = connectors::open_session();
-        // The materialized-view store also holds the persisted dynamic-datasource
-        // registry (both live in the config's stats SQLite); open it first so the
-        // persisted sources merge with the YAML bootstrap set below.
-        let accelerator = materialized::open_accelerator(config)?;
-        let persisted = match &accelerator {
-            Some(accel) => accel.list_datasources()?,
+        let session_guard = SessionGuard(Some(connectors::open_session()));
+        let session = session_guard.id();
+        let server_catalog = database_manager
+            .as_ref()
+            .map(|manager| Arc::clone(manager.server_catalog()));
+        let database_catalog = databases::open_database_catalog(database_lease.as_deref())?;
+        let accelerator = materialized::open_accelerator(database_lease.as_deref())?;
+        // Seed the YAML definitions into the selected database (only main
+        // carries YAML sources; other databases cleared them above), then read
+        // the complete persisted set back.
+        if let Some(definitions) = &database_catalog {
+            dynamic_catalog::seed_bootstrap_datasources(config, definitions)?;
+        }
+        let persisted = match &database_catalog {
+            Some(catalog) => catalog.list_datasources()?,
             None => Vec::new(),
         };
-        // Persisted SET overrides apply on top of the YAML config BEFORE
-        // anything reads a setting, so a SET from an earlier session governs
-        // this construction exactly like it governed the session that set it.
-        let mut config = config.clone();
-        let mut persisted_overrides = BTreeSet::new();
-        if let Some(accel) = &accelerator {
-            for (name, value) in accel.list_settings()? {
-                Self::apply_persisted_setting(&mut config, &name, &value)?;
-                persisted_overrides.insert(name);
-            }
-        }
+        let (config, persisted_overrides) =
+            Self::with_persisted_settings(database_catalog.as_ref(), config)?;
         let config = &config;
-        dynamic_catalog::reject_bootstrap_collision(config, &persisted)?;
-        let mut catalog = Catalog::new();
-        // YAML (bootstrap) sources are operator-controlled at deploy time, so a
-        // failure to connect one aborts construction.
-        for datasource in config.datasources.values() {
-            register_datasource(session, &mut catalog, datasource)?;
-        }
-        // The materialized-view store registers as one more datasource (its
-        // views load through the same metadata path) and its chunk tables go
-        // to the exec data plane, so a NEW runtime over the same config sees
-        // every view a previous session created.
-        if let Some(accel) = &accelerator {
-            materialized::register_store(session, &mut catalog, accel)?;
-            // Non-materialized views are metadata only: registering them needs no
-            // data plane, and their definitions expand at plan time.
-            views::install_persisted_views(&mut catalog, accel)?;
-        }
-        catalog.load_metadata()?;
-        // Persisted dynamic sources are added post-deploy and may be transiently
-        // offline; each is validated in isolation and a failure marks THAT source
-        // unavailable (its reference raises the stored error) instead of aborting.
-        dynamic_catalog::install_persisted_datasources(
+        let catalog = Self::build_catalog(
             session,
-            &mut catalog,
+            config,
+            accelerator.as_ref(),
+            database_catalog.as_ref(),
+            database_lease.as_deref().map(|lease| lease.descriptor.id),
             &persisted,
-            config.catalog.create_connect_timeout_ms,
-        );
+        )?;
         // A change-key declaration naming an unknown table/column, or a
         // monotonic column whose type cannot carry a watermark, fails HERE at
         // load - not silently at a refresh months later.
@@ -179,11 +240,15 @@ impl Runtime {
         // (idempotent); thereafter the persisted table is authoritative. The
         // embedded process runs as an implicit superuser, so it does not enforce,
         // but it can still administer the store a wire server enforces against.
-        if let Some(accel) = &accelerator {
-            acl::import_bootstrap_users(accel, &config.server.users)?;
+        if let Some(identities) = &server_catalog {
+            acl::import_bootstrap_users(identities, &config.server.users)?;
         }
         let catalog = Arc::new(catalog);
-        let learned = open_stats_catalog(config)?;
+        let learned = open_stats_catalog(
+            database_lease
+                .as_deref()
+                .map(|lease| lease.paths.metadata.as_path()),
+        )?;
         let stats = Arc::new(StatisticsCollector::new(
             Arc::clone(&catalog),
             learned.clone(),
@@ -197,9 +262,16 @@ impl Runtime {
         prewarm_source_statistics(&catalog, &stats)?;
         // Recorded LAST, so the identity every later statement is checked
         // against is the file the subsystems above just opened (or created).
-        let state_store = state_store::StateStore::record(config)?;
-        Ok(Self {
-            session,
+        let state_store = state_store::StateStore::record(databases::guarded_paths(
+            database_manager.as_ref(),
+            database_lease.as_deref(),
+        ))?;
+        let catalog_generation = match &database_catalog {
+            Some(definitions) => definitions.catalog_generation()?,
+            None => 0,
+        };
+        let runtime = Self {
+            session: session_guard.defuse(),
             catalog: RwLock::new(catalog),
             config: RwLock::new(config.clone()),
             settings_overrides: RwLock::new(persisted_overrides),
@@ -207,9 +279,73 @@ impl Runtime {
             stats: RwLock::new(stats),
             learned,
             accelerator,
+            server_catalog,
+            database_catalog,
             authz: RwLock::new(acl::AclState::embedded()),
             state_store,
-        })
+            catalog_generation: RwLock::new(catalog_generation),
+            database_manager,
+            database_lease,
+        };
+        if let Some(principal) = principal {
+            runtime.set_principal_by_id(principal)?;
+        }
+        Ok(runtime)
+    }
+
+    /// Apply persisted SET overrides on top of the YAML config BEFORE
+    /// anything reads a setting, so a SET from an earlier session governs
+    /// this construction exactly like it governed the session that set it.
+    fn with_persisted_settings(
+        database_catalog: Option<&fq_catalog::store::DatabaseCatalog>,
+        config: &Config,
+    ) -> Result<(Config, BTreeSet<String>), RuntimeError> {
+        let mut config = config.clone();
+        let mut persisted_overrides = BTreeSet::new();
+        if let Some(catalog) = database_catalog {
+            for (name, value) in catalog.list_settings()? {
+                Self::apply_persisted_setting(&mut config, &name, &value)?;
+                persisted_overrides.insert(name);
+            }
+        }
+        Ok((config, persisted_overrides))
+    }
+
+    /// Assemble the metadata catalog: YAML sources (a failure to connect one
+    /// aborts construction), the materialized-view store, persisted views,
+    /// then persisted dynamic sources (each validated in isolation; a failure
+    /// marks THAT source unavailable instead of aborting).
+    fn build_catalog(
+        session: connectors::SessionId,
+        config: &Config,
+        accelerator: Option<&Accelerator>,
+        database_catalog: Option<&fq_catalog::store::DatabaseCatalog>,
+        database_id: Option<fq_common::database::DatabaseId>,
+        persisted: &[fq_catalog::store::DatasourceDefinition],
+    ) -> Result<Catalog, RuntimeError> {
+        let mut catalog = Catalog::new();
+        for datasource in config.datasources.values() {
+            register_datasource(session, &mut catalog, datasource)?;
+        }
+        if let Some(accel) = accelerator {
+            materialized::register_store(session, &mut catalog, accel, database_catalog)?;
+        }
+        if let Some(definitions) = database_catalog {
+            views::install_persisted_views(&mut catalog, definitions, database_id)?;
+        }
+        catalog.load_metadata()?;
+        let dynamic_only: Vec<fq_catalog::store::DatasourceDefinition> = persisted
+            .iter()
+            .filter(|row| !config.datasources.contains_key(&row.definition.name))
+            .cloned()
+            .collect();
+        dynamic_catalog::install_persisted_datasources(
+            session,
+            &mut catalog,
+            &dynamic_only,
+            config.catalog.create_connect_timeout_ms,
+        );
+        Ok(catalog)
     }
 
     /// This runtime's data-plane session id, for a test/tool that reads the
@@ -221,6 +357,76 @@ impl Runtime {
     /// The current catalog snapshot (consistent for the caller's whole plan).
     fn catalog_snapshot(&self) -> Arc<Catalog> {
         Arc::clone(&self.catalog.read().expect("catalog lock poisoned"))
+    }
+
+    /// Rebuild the live catalog when another session published local DDL.
+    /// The rebuild is metadata-only: persisted views and datasource
+    /// definitions are reinstalled and dropped dynamic sources are removed,
+    /// then the new snapshot swaps in atomically. A failure raises and the
+    /// stale snapshot is not served for this statement.
+    fn refresh_catalog(&self) -> Result<(), RuntimeError> {
+        let Some(definitions) = &self.database_catalog else {
+            return Ok(());
+        };
+        let generation = definitions.catalog_generation()?;
+        let seen = *self
+            .catalog_generation
+            .read()
+            .expect("catalog generation lock poisoned");
+        if seen == generation {
+            return Ok(());
+        }
+        let mut next = (*self.catalog_snapshot()).clone();
+        let view_names: Vec<String> = next
+            .view_names()
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect();
+        for name in &view_names {
+            next.remove_view(name);
+        }
+        views::install_persisted_views(
+            &mut next,
+            definitions,
+            self.database_lease
+                .as_deref()
+                .map(|lease| lease.descriptor.id),
+        )?;
+        let persisted = definitions.list_datasources()?;
+        let config_names: Vec<String> =
+            self.config_snapshot().datasources.keys().cloned().collect();
+        let dynamic_only: Vec<fq_catalog::store::DatasourceDefinition> = persisted
+            .iter()
+            .filter(|row| !config_names.contains(&row.definition.name))
+            .cloned()
+            .collect();
+        dynamic_catalog::install_persisted_datasources(
+            self.session,
+            &mut next,
+            &dynamic_only,
+            self.config_snapshot().catalog.create_connect_timeout_ms,
+        );
+        let config = self.config_snapshot();
+        for name in next.datasource_names() {
+            let persisted_source = persisted.iter().any(|row| row.definition.name == name);
+            let bootstrap_source = config.datasources.contains_key(&name);
+            let accel_source = self
+                .accelerator
+                .as_ref()
+                .is_some_and(|accel| accel.datasource_name() == name);
+            if !persisted_source && !bootstrap_source && !accel_source {
+                next.remove_datasource(&name);
+            }
+        }
+        self.swap_catalog(next);
+        if self.accelerator.is_some() {
+            self.install_views()?;
+        }
+        *self
+            .catalog_generation
+            .write()
+            .expect("catalog generation lock poisoned") = generation;
+        Ok(())
     }
 
     /// The current config snapshot: ONE consistent copy for a whole plan, so a
@@ -255,15 +461,23 @@ impl Runtime {
     /// a cosmetic clash - a reference resolves to whichever kind the resolver
     /// reaches first (a view is expanded before a table is looked up), so the
     /// loser is silently read from the wrong relation.
-    pub(crate) fn relation_name_holder(&self, name: &str) -> Option<&'static str> {
+    pub(crate) fn relation_name_holder(
+        &self,
+        name: &str,
+    ) -> Result<Option<&'static str>, RuntimeError> {
+        if let Some(definitions) = &self.database_catalog {
+            if definitions.find_relation(name)?.is_some() {
+                return Ok(Some("a registered relation"));
+            }
+        }
         let catalog = self.catalog_snapshot();
         if catalog.resolve_table(None, None, name).is_some() {
-            return Some("a table or materialized view");
+            return Ok(Some("a table or materialized view"));
         }
         if catalog.get_view(name).is_some() {
-            return Some("a view");
+            return Ok(Some("a view"));
         }
-        None
+        Ok(None)
     }
 
     /// Run one SQL statement and return its Arrow result under the query's
@@ -276,6 +490,8 @@ impl Runtime {
     /// paths poison the runtime: every later call returns that same fatal error.
     pub fn execute(&self, sql: &str) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
         self.state_store.check()?;
+        self.refresh_acl()?;
+        self.refresh_catalog()?;
         let result = self.run_statement(sql);
         if result.is_err() {
             self.state_store.check()?;
@@ -302,12 +518,21 @@ impl Runtime {
             return self.explain(sql);
         }
         let statement = classify_statement(sql)?;
-        // Admin DDL is superuser-gated BEFORE the handler runs: a non-superuser
-        // gets an explicit permission error (the statement kind is not a secret).
-        if let Some(action) = acl::superuser_action(&statement) {
-            self.require_superuser(action)?;
-        }
+        self.authorize_statement(&statement)?;
         match statement {
+            Statement::GrantDatabase {
+                name,
+                grantee,
+                privilege,
+            } => self.grant_database(&name, &grantee, privilege),
+            Statement::RevokeDatabase {
+                name,
+                grantee,
+                privilege,
+            } => self.revoke_database(&name, &grantee, privilege),
+            Statement::CreateDatabase { name } => self.create_database(&name),
+            Statement::DropDatabase { name } => self.drop_database(&name),
+            Statement::ShowDatabases => self.show_databases(),
             Statement::Query(text) => self.execute_query(text),
             Statement::CreateMaterializedView { name, select_sql } => {
                 self.create_materialized_view(&name, select_sql)
@@ -361,10 +586,10 @@ impl Runtime {
     /// Plan and run one user SELECT/VALUES statement through the full pipeline,
     /// with view substitution enabled.
     fn execute_query(&self, sql: &str) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
-        let (physical, substitutions) = self.plan_inner(sql, QueryPurpose::User)?;
-        let visible_names = fq_plan::physical::visible_output_names(&physical);
-        let execution = execute_plan(self.session, &physical)?;
-        self.record_pushdown_fragments(&physical)?;
+        let (planned, substitutions) = self.plan_inner(sql, QueryPurpose::User)?;
+        let visible_names = fq_plan::physical::visible_output_names(&planned);
+        let execution = execute_plan(self.session, &planned)?;
+        self.record_pushdown_fragments(&planned)?;
         // The learned-stats WRITE path: each measured (binding, rows) whose
         // binding carries provenance lands in the stats catalog, AFTER the
         // result is materialized (off the query's critical path). The next
@@ -393,10 +618,10 @@ impl Runtime {
     /// Execute an already-bound source plan without planning it a second time.
     fn execute_source_plan(
         &self,
-        physical: &PhysicalPlan,
+        planned: &PhysicalPlan,
     ) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
-        let visible_names = fq_plan::physical::visible_output_names(physical);
-        let execution = execute_plan(self.session, physical)?;
+        let visible_names = fq_plan::physical::visible_output_names(planned);
+        let execution = execute_plan(self.session, planned)?;
         self.persist_observations(&execution.measurements, &execution.observations)?;
         rename_result(&execution.schema, execution.batches, &visible_names)
     }
@@ -435,6 +660,8 @@ impl Runtime {
     /// catalog state that is no longer backed by anything.
     pub fn describe(&self, sql: &str) -> Result<Vec<(String, DataType)>, RuntimeError> {
         self.state_store.check()?;
+        self.refresh_acl()?;
+        self.refresh_catalog()?;
         let result = self.describe_statement(sql);
         if result.is_err() {
             self.state_store.check()?;
@@ -445,13 +672,17 @@ impl Runtime {
     /// Resolve the result columns of `sql` by planning only, per `describe`.
     fn describe_statement(&self, sql: &str) -> Result<Vec<(String, DataType)>, RuntimeError> {
         if fq_parse::explain::split(sql)?.is_some() {
+            let _planned = self.plan(sql)?;
             return Ok(vec![("plan".to_owned(), DataType::Text)]);
         }
         // A non-query statement resolves to the columns its execution returns,
         // without running it: SHOW resolves to the settings result columns, the
         // analysis forms to their fixed result relations, and every DDL / SET /
         // RESET to the single `status` column (the pg command-tag convention).
-        match classify_statement(sql)? {
+        let statement = classify_statement(sql)?;
+        self.authorize_statement(&statement)?;
+        match statement {
+            Statement::ShowDatabases => return Ok(vec![("name".to_string(), DataType::Text)]),
             Statement::Query(_) => {}
             Statement::ShowSettings | Statement::ShowSetting { .. } => {
                 return Ok(settings::describe_columns());
@@ -520,6 +751,17 @@ impl Runtime {
         Ok(optimized)
     }
 
+    /// Parse and bind a stored definition under the caller's authorization
+    /// without executing it.
+    pub(crate) fn bind_definition(
+        &self,
+        catalog: &Catalog,
+        sql: &str,
+    ) -> Result<fq_plan::LogicalPlan, RuntimeError> {
+        let parsed = parse_with_catalog(sql, catalog)?;
+        self.bind_with_authz(catalog, parsed)
+    }
+
     /// Lower SQL into an executable physical plan under the planning budget.
     ///
     /// Planning is O(metadata) BY DESIGN and budget-enforced: ONE clock covers
@@ -559,14 +801,28 @@ impl Runtime {
         let stats = self.stats_snapshot();
         stats.set_plan_budget(stages.budget);
         stats.set_learned_enabled(config.optimizer.enable_learned_statistics);
-        let optimized = self.optimize(&catalog, sql, &mut stages, &config)?;
-        let cost_model = Rc::new(RefCell::new(self.cost_model(&config)));
+        let planned = self.plan_attempt(sql, purpose, &catalog, &config, &mut stages)?;
+        stages.emit_success();
+        Ok(planned)
+    }
+
+    /// Build one metadata-consistent attempt under the statement's unchanged planning budget.
+    fn plan_attempt(
+        &self,
+        sql: &str,
+        purpose: QueryPurpose,
+        catalog: &Arc<Catalog>,
+        config: &Config,
+        stages: &mut StageLog,
+    ) -> Result<(PhysicalPlan, Vec<substitute::AppliedSubstitution>), RuntimeError> {
+        let optimized = self.optimize(catalog, sql, stages, config)?;
+        let cost_model = Rc::new(RefCell::new(self.cost_model(config)));
         // Substitute matching materialized views for recomputed subtrees BEFORE
         // physical planning, so the planner and step builder see the reduced
         // tree (a substituted scan is a local leaf, so dim shipping leaves it
         // alone). This step is O(views x metadata) and budget-tracked.
         let (substituted, applied) = if purpose == QueryPurpose::User {
-            self.substitute_views(optimized, &catalog, &config, &cost_model)?
+            self.substitute_views(optimized, catalog, config, &cost_model)?
         } else {
             (optimized, Vec::new())
         };
@@ -575,7 +831,7 @@ impl Runtime {
         // config that lowers them (small fixtures) or raises them (kill switch)
         // governs whether a dimension ships.
         let ship_thresholds = ShipThresholds::from_config(&config.optimizer);
-        let mut planner = PhysicalPlanner::new(Arc::clone(&catalog), Some(Rc::clone(&cost_model)))
+        let mut planner = PhysicalPlanner::new(Arc::clone(catalog), Some(Rc::clone(&cost_model)))
             .with_ship_thresholds(ship_thresholds)
             .with_single_source_pushdown(config.optimizer.enable_single_source_pushdown);
         let physical = planner.plan(&substituted)?;
@@ -585,7 +841,6 @@ impl Runtime {
         // Reads only the plan, so it cannot threaten the planning budget.
         check_referential_closure(&physical)?;
         stages.finish("physical")?;
-        stages.emit_success();
         Ok((physical, applied))
     }
 
@@ -666,24 +921,6 @@ impl Drop for Runtime {
         connectors::prune_session(self.session);
     }
 }
-
-/// The path of the stats SQLite that lives NEXT TO the config file
-/// (`<config-stem>.stats.sqlite`, one per configuration; it also carries the
-/// materialized-view registry), or `None` for a programmatically built config
-/// with no source path.
-pub(crate) fn stats_sqlite_path(config: &Config) -> Option<std::path::PathBuf> {
-    let source_path = config.source_path.as_deref()?;
-    let path = std::path::Path::new(source_path);
-    let stem = path
-        .file_stem()
-        .map_or_else(|| "fedq".to_string(), |s| s.to_string_lossy().to_string());
-    Some(
-        path.parent()
-            .unwrap_or_else(|| std::path::Path::new("."))
-            .join(stem + ".stats.sqlite"),
-    )
-}
-
 /// Fetch every cataloged table's source statistics into the session cache, so
 /// no query's planning window pays a source round trip for a table that existed
 /// at construction. A table registered later (dynamic catalog) is still fetched
@@ -721,34 +958,14 @@ fn table_column_names(
     names
 }
 
-/// Open the learned-statistics catalog: `$FEDQ_STATS_CATALOG` when set,
-/// otherwise the path derived from the config file.
-///
-/// A config built in memory has no file behind it and so no derived path. That
-/// case WARNS: a runtime with no catalog plans every query on default constants,
-/// and without the warning that state is indistinguishable from running with
-/// one. The override is how a programmatic config gets a catalog at all.
-fn open_stats_catalog(config: &Config) -> Result<Option<Arc<StatsCatalog>>, RuntimeError> {
-    let Some(path) = learned_catalog_path(config) else {
-        tracing::warn!(
-            "no learned-statistics catalog: this config has no file path to derive \
-             one from. Every estimate falls back to default constants. Set \
-             FEDQ_STATS_CATALOG to name one."
-        );
-        return Ok(None);
-    };
-    let catalog = StatsCatalog::open(&path.to_string_lossy())?;
-    Ok(Some(Arc::new(catalog)))
-}
-
-/// Where the learned-statistics catalog lives: the `$FEDQ_STATS_CATALOG`
-/// override when set, otherwise the stats SQLite derived from the config file.
-/// `None` for an in-memory config with neither.
-pub(crate) fn learned_catalog_path(config: &Config) -> Option<std::path::PathBuf> {
-    if let Some(explicit) = std::env::var_os("FEDQ_STATS_CATALOG") {
-        return Some(std::path::PathBuf::from(explicit));
+/// Open learned statistics only inside the selected persistent database.
+fn open_stats_catalog(
+    path: Option<&std::path::Path>,
+) -> Result<Option<Arc<StatsCatalog>>, RuntimeError> {
+    match path {
+        Some(path) => Ok(Some(Arc::new(StatsCatalog::open(&path.to_string_lossy())?))),
+        None => Ok(None),
     }
-    stats_sqlite_path(config)
 }
 
 /// Dispatch one observation to its catalog table by provenance kind. The

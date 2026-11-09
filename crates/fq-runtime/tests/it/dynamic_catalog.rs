@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use arrow::array::{Array, RecordBatch, StringArray};
-use fq_accel::{Accelerator, DynamicDatasource};
+use fq_catalog::store::DatabaseCatalog;
 use fq_common::{
     Config, CostConfig, DataSourceConfig, ExecutorConfig, OptimizerConfig, ServerConfig,
 };
@@ -61,6 +61,7 @@ impl Sandbox {
     /// the sandbox (which gives the runtime a persisted datasource store).
     fn config(&self, datasources: BTreeMap<String, DataSourceConfig>) -> Config {
         Config {
+            storage: fq_common::StorageConfig::default(),
             datasources,
             optimizer: OptimizerConfig::default(),
             executor: ExecutorConfig::default(),
@@ -78,10 +79,15 @@ impl Sandbox {
         Runtime::from_config(&self.config(BTreeMap::new())).expect("from_config")
     }
 
-    /// The accelerator over this sandbox's store, for asserting/seeding the
+    /// The database catalog over this sandbox's store, for asserting/seeding the
     /// persisted dynamic-datasource table directly.
-    fn accelerator(&self) -> Accelerator {
-        Accelerator::open(&self.dir.join("config.yaml")).expect("open accelerator")
+    fn database_catalog(&self) -> DatabaseCatalog {
+        DatabaseCatalog::open(
+            &super::storage::main_paths(&self.dir.join("config.data"))
+                .metadata
+                .to_string_lossy(),
+        )
+        .expect("open definitions")
     }
 }
 
@@ -186,7 +192,7 @@ fn new_runtime_sees_persisted_source() {
 }
 
 #[test]
-fn bootstrap_collision_raises() {
+fn bootstrap_redefinition_raises() {
     let sandbox = Sandbox::new("collision");
     let path = sandbox.seed_duck("c.duckdb", "t", &[(1, "a")]);
     {
@@ -197,12 +203,13 @@ fn bootstrap_collision_raises() {
             ))
             .expect("create datasource");
     }
-    // A YAML block now also declares `dup`: the effective source is ambiguous,
-    // so construction refuses rather than pick one silently.
+    // A YAML block now redefines `dup` with a different path: the stored
+    // definition wins loudly - construction refuses rather than replace it.
+    let other = sandbox.seed_duck("other.duckdb", "t", &[(2, "b")]);
     let mut datasources = BTreeMap::new();
-    datasources.insert("dup".to_string(), duck_bootstrap("dup", &path));
+    datasources.insert("dup".to_string(), duck_bootstrap("dup", &other));
     let error = Runtime::from_config(&sandbox.config(datasources));
-    assert!(error.is_err(), "a YAML/persisted name collision must raise");
+    assert!(error.is_err(), "a differing YAML redefinition must raise");
 }
 
 #[test]
@@ -256,7 +263,7 @@ fn create_validation_failure_persists_nothing() {
     assert!(created.is_err(), "a source that fails to open must raise");
     assert!(
         sandbox
-            .accelerator()
+            .database_catalog()
             .list_datasources()
             .expect("list")
             .is_empty(),
@@ -270,20 +277,27 @@ fn show_redacts_a_persisted_password() {
     // Seed a persisted postgres row (with a password) directly, so SHOW renders
     // it without connecting. The password must never appear in the output.
     let mut params = BTreeMap::new();
-    params.insert("host".to_string(), "db.example".to_string());
-    params.insert("port".to_string(), "5432".to_string());
-    params.insert("database".to_string(), "sales".to_string());
-    params.insert("schemas".to_string(), "public".to_string());
-    params.insert("user".to_string(), "sam".to_string());
-    params.insert("password".to_string(), "s3cr3t-token".to_string());
-    let row = DynamicDatasource {
+    params.insert("host".to_string(), Value::String("db.example".to_string()));
+    params.insert("port".to_string(), Value::String("5432".to_string()));
+    params.insert("database".to_string(), Value::String("sales".to_string()));
+    params.insert(
+        "schemas".to_string(),
+        Value::Sequence(vec![Value::String("public".to_string())]),
+    );
+    params.insert("user".to_string(), Value::String("sam".to_string()));
+    params.insert(
+        "password".to_string(),
+        Value::String("s3cr3t-token".to_string()),
+    );
+    let row = DataSourceConfig {
         name: "warehouse".to_string(),
-        kind: "postgres".to_string(),
-        params,
-        created_at: String::new(),
+        ty: "postgres".to_string(),
+        config: params,
+        capabilities: Vec::new(),
+        change_keys: BTreeMap::new(),
     };
     assert!(sandbox
-        .accelerator()
+        .database_catalog()
         .insert_datasource(&row)
         .expect("insert"));
 
@@ -309,15 +323,19 @@ fn scoped_unavailable_defers_the_raise_to_the_reference() {
     let junk = sandbox.dir.join("junk.duckdb");
     std::fs::write(&junk, b"garbage").expect("write junk");
     let mut params = BTreeMap::new();
-    params.insert("path".to_string(), junk.to_string_lossy().to_string());
-    let dead = DynamicDatasource {
+    params.insert(
+        "path".to_string(),
+        Value::String(junk.to_string_lossy().to_string()),
+    );
+    let dead = DataSourceConfig {
         name: "dead".to_string(),
-        kind: "duckdb".to_string(),
-        params,
-        created_at: String::new(),
+        ty: "duckdb".to_string(),
+        config: params,
+        capabilities: Vec::new(),
+        change_keys: BTreeMap::new(),
     };
     assert!(sandbox
-        .accelerator()
+        .database_catalog()
         .insert_datasource(&dead)
         .expect("insert"));
 
@@ -353,7 +371,7 @@ fn drop_purges_learned_stats() {
         .expect("create datasource");
 
     // Record a learned row for the source, then assert DROP removes it.
-    let stats_path = sandbox.dir.join("config.stats.sqlite");
+    let stats_path = super::storage::main_paths(&sandbox.dir.join("config.data")).metadata;
     let stats = StatsCatalog::open(&stats_path.to_string_lossy()).expect("open stats");
     stats
         .record_table_rows("learn", "main", "t", 42)

@@ -95,6 +95,7 @@ fn two_source_runtime(tag: &str) -> (Runtime, String, String) {
         duck_datasource(&customers_name, &customers_path),
     );
     let config = Config {
+        storage: fq_common::StorageConfig::default(),
         datasources,
         optimizer: OptimizerConfig::default(),
         executor: ExecutorConfig::default(),
@@ -467,6 +468,7 @@ fn two_source_runtime_seeded(
         duck_datasource(&second_name, &second_path),
     );
     let config = Config {
+        storage: fq_common::StorageConfig::default(),
         datasources,
         optimizer: OptimizerConfig::default(),
         executor: ExecutorConfig::default(),

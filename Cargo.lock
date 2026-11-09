@@ -1848,7 +1848,7 @@ dependencies = [
  "arrow",
  "async-trait",
  "base64",
- "fq-accel",
+ "fq-catalog",
  "fq-common",
  "fq-connectors",
  "fq-runtime",
@@ -1858,6 +1858,7 @@ dependencies = [
  "rand 0.9.5",
  "ring",
  "serde_yaml",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-postgres",
  "tracing",
@@ -1979,6 +1980,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -5018,6 +5020,7 @@ checksum = "bf80a72845275afea99e7f2b434723d3bc7e38470fcd1c7ed39a599c73319a53"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
+ "serde_core",
  "wasm-bindgen",
 ]
 

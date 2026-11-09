@@ -168,10 +168,8 @@ pub use handler::FedqHandlers;
 pub use session::Session;
 
 use std::io;
-use std::path::Path;
 use std::sync::Arc;
 
-use fq_accel::Accelerator;
 use fq_common::Config;
 use pgwire::api::ConnectionManager;
 use pgwire::tokio::process_socket;
@@ -217,16 +215,18 @@ pub async fn serve(config: Config, listener: TcpListener) -> std::io::Result<()>
 /// `None` for trust mode (no users), where every connection runs as an implicit
 /// superuser with enforcement off.
 fn build_auth_source(config: &Config) -> Result<Option<Arc<StoreAuthSource>>, String> {
-    if config.server.users.is_empty() {
+    config
+        .server
+        .validate()
+        .map_err(|error| error.to_string())?;
+    if config.server.auth == fq_common::security::AuthMode::Trust {
         return Ok(None);
     }
-    let source_path = config.source_path.as_deref().ok_or_else(|| {
-        "server authentication requires a file-based config (the ACL store lives \
-         next to it), but this config has no source path"
-            .to_string()
-    })?;
-    let store =
-        Arc::new(Accelerator::open(Path::new(source_path)).map_err(|error| error.to_string())?);
+    let store = fq_runtime::open_server_catalog(config)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| {
+            "server authentication requires a configured identity catalog".to_string()
+        })?;
     fq_runtime::import_bootstrap_users(&store, &config.server.users)
         .map_err(|error| error.to_string())?;
     fq_runtime::require_a_superuser(&store).map_err(|error| error.to_string())?;

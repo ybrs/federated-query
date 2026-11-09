@@ -83,6 +83,7 @@ impl Sandbox {
             },
         );
         Config {
+            storage: fq_common::StorageConfig::default(),
             datasources,
             optimizer: OptimizerConfig::default(),
             executor: ExecutorConfig::default(),
@@ -111,7 +112,13 @@ impl Sandbox {
 
     /// A registry handle on the same store, for chunk-list assertions.
     fn accel(&self) -> Accelerator {
-        Accelerator::open(&self.dir.join("config.yaml")).expect("open store")
+        {
+            let manager =
+                fq_runtime::DatabaseManager::open(&self.dir.join("config.data")).expect("manager");
+            let database = manager.acquire("main").expect("main");
+            Accelerator::open(&database.paths.metadata, &database.paths.materialized)
+                .expect("open store")
+        }
     }
 }
 

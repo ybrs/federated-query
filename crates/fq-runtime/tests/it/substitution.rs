@@ -77,6 +77,7 @@ impl Sandbox {
             },
         );
         Config {
+            storage: fq_common::StorageConfig::default(),
             datasources,
             optimizer: OptimizerConfig::default(),
             executor: ExecutorConfig::default(),

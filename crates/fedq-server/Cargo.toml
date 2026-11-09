@@ -15,6 +15,7 @@ name = "fedq-server"
 path = "src/main.rs"
 
 [dependencies]
+thiserror = "2"
 # The Postgres wire protocol server API with the `ring` crypto backend, which is
 # what compiles pgwire's SCRAM-SHA-256 handshake (the `sasl` module is gated
 # behind `_ring`/`_aws-lc-rs`). `ring` is chosen over `aws-lc-rs` because it is
@@ -46,7 +47,7 @@ fq-runtime = { path = "../fq-runtime" }
 fq-scram = { path = "../fq-scram" }
 # The durable store the auth source reads verifiers from and the server seeds the
 # bootstrap users into at startup.
-fq-accel = { path = "../fq-accel" }
+fq-catalog = { path = "../fq-catalog" }
 
 [dev-dependencies]
 # The integration test drives the server with a real Postgres client.

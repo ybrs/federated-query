@@ -145,6 +145,7 @@ fn cross_config(duck_path: &str, parquet_dir: &str) -> Config {
 /// Wrap a datasource map in a default-everything-else `Config`.
 fn base_config(datasources: BTreeMap<String, DataSourceConfig>) -> Config {
     Config {
+        storage: fq_common::StorageConfig::default(),
         datasources,
         optimizer: OptimizerConfig::default(),
         executor: ExecutorConfig::default(),
@@ -507,31 +508,26 @@ fn every_real_datasource_parameter_is_still_accepted() {
         .expect("a config using only real keys still builds");
 }
 
+/// Programmatic runtimes persist learned statistics inside their selected database.
 #[test]
-fn a_programmatic_config_can_be_given_a_learned_catalog() {
-    // A config built in memory has no file path, so no catalog path derives from
-    // it and every estimate falls back to default constants. FEDQ_STATS_CATALOG
-    // names one explicitly. Observable because opening the catalog CREATES the
-    // sqlite file at that path.
-    let dir = temp_parquet_dir("stats_override");
+fn a_programmatic_config_can_be_given_persistent_storage() {
+    let dir = temp_parquet_dir("explicit_storage");
     write_region_parquet(&dir);
-    let catalog_path = dir.join("explicit.stats.sqlite");
-    assert!(!catalog_path.exists(), "starts absent");
-
     let mut config = parquet_config(dir.to_str().unwrap());
-    // A programmatic config: no file behind it.
     config.source_path = None;
-
-    // SAFETY: set and restored within this test; no other test reads this var.
-    unsafe { std::env::set_var("FEDQ_STATS_CATALOG", &catalog_path) };
-    let built = Runtime::from_config(&config);
-    unsafe { std::env::remove_var("FEDQ_STATS_CATALOG") };
-    built.expect("runtime builds with an explicit catalog");
-
-    assert!(
-        catalog_path.exists(),
-        "the named catalog was opened at {}",
-        catalog_path.display()
+    let root = dir.join("engine-data");
+    config.storage.root = Some(root.clone());
+    let runtime = Runtime::from_config(&config).expect("runtime with explicit storage");
+    runtime
+        .execute("SELECT r_regionkey FROM pq.main.region")
+        .expect("learned query");
+    let metadata = super::storage::main_paths(&root).metadata;
+    let stats = fq_catalog::StatsCatalog::open(&metadata.to_string_lossy()).expect("learned stats");
+    assert_eq!(
+        stats
+            .table_rows("pq", "main", "region", None)
+            .expect("table rows"),
+        Some(5)
     );
 }
 

@@ -67,7 +67,7 @@ def _write_config(directory, duck_path, verifier_block):
     handle = open(path, "w")
     handle.write("datasources:\n  duck:\n    type: duckdb\n")
     handle.write("    path: " + duck_path + "\n")
-    handle.write("server:\n  users:\n")
+    handle.write("server:\n  auth: scram\n  users:\n")
     handle.write(verifier_block)
     handle.close()
     return path
@@ -124,7 +124,7 @@ def _connect(port, user, password):
         port=port,
         user=user,
         password=password,
-        dbname="fedq",
+        dbname="main",
     )
     connection.autocommit = True
     return connection
@@ -143,6 +143,7 @@ def test_superuser_provisions_and_a_restricted_principal_is_enforced(server):
     """Admin provisions bob; bob reads the grant and is blocked from a sibling."""
     admin = _connect(server, "admin", _PASSWORD)
     admin.cursor().execute("CREATE USER bob WITH PASSWORD '" + _BOB_PASSWORD + "'")
+    admin.cursor().execute("GRANT CONNECT ON DATABASE main TO bob")
     admin.cursor().execute("GRANT SELECT ON TABLE duck.main.orders TO bob")
     admin.close()
     time.sleep(1)

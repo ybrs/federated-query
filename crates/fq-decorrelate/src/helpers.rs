@@ -408,6 +408,7 @@ mod tests {
             input: Box::new(scan("orders", Some("o"), &["id"])),
             alias: "sub".to_string(),
             column_names: None,
+            origin: fq_plan::SubqueryOrigin::Derived,
         });
         let aliases = collect_inner_aliases(&inner);
         // Both the boundary alias AND the transitively-collected inner alias.

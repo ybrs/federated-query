@@ -5,7 +5,9 @@
 //! and `_disjunct_term`.
 
 use fq_plan::expr::{split_conjuncts, split_disjuncts, BinaryOpType, ColumnRef, Expr};
-use fq_plan::logical::{Join, JoinType, LogicalPlan, Projection, SubqueryScan, Union};
+use fq_plan::logical::{
+    Join, JoinType, LogicalPlan, Projection, SubqueryOrigin, SubqueryScan, Union,
+};
 
 use crate::boolean::constant_exists_value;
 use crate::helpers::{bool_literal, expression_has_subquery, is_subquery_node, or_join};
@@ -147,6 +149,7 @@ impl Decorrelator {
             input: Box::new(union),
             alias: prefix.clone(),
             column_names: None,
+            origin: SubqueryOrigin::Derived,
         });
         // The domain key inherits the outer key's type: the equality's two sides
         // share it, and the outer side is bound.

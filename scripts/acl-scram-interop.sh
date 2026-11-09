@@ -40,6 +40,7 @@ CONFIG=$WORK/config.yaml
   echo "    type: duckdb"
   echo "    path: $WORK/shop.duckdb"
   echo "server:"
+  echo "  auth: scram"
   echo "  users:"
   echo "$VERIFIER_BLOCK"
 } > "$CONFIG"
@@ -53,12 +54,12 @@ sleep 2
 RESULT=0
 
 echo "== CORRECT password (must succeed and return rows) =="
-PGPASSWORD="$PASSWORD" "$PSQL" "host=127.0.0.1 port=$PORT user=admin dbname=fedq" \
+PGPASSWORD="$PASSWORD" "$PSQL" "host=127.0.0.1 port=$PORT user=admin dbname=main" \
   -c "SELECT count(*) AS n FROM duck.main.orders" -t
 if [ $? -ne 0 ]; then echo "FAIL: correct password could not query"; RESULT=1; fi
 
 echo "== WRONG password (must be rejected) =="
-PGPASSWORD="wrong-$PASSWORD" "$PSQL" "host=127.0.0.1 port=$PORT user=admin dbname=fedq" \
+PGPASSWORD="wrong-$PASSWORD" "$PSQL" "host=127.0.0.1 port=$PORT user=admin dbname=main" \
   -c "SELECT 1" -t >"$WORK/wrong.out" 2>&1
 WRONG_STATUS=$?
 cat "$WORK/wrong.out"

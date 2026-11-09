@@ -19,13 +19,11 @@
 //! entirely: an open connection keeps reading the unlinked inode and would serve
 //! state no longer at that path.
 
-use std::collections::BTreeSet;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::sync::{Mutex, OnceLock};
 
-use fq_common::Config;
 use rusqlite::{ffi, Connection, OpenFlags};
 
 use crate::error::RuntimeError;
@@ -66,9 +64,9 @@ impl StateStore {
     /// check compares against. A config with no file path behind it guards
     /// nothing (there is no store to lose), so the file list is empty and the
     /// check is a no-op.
-    pub(crate) fn record(config: &Config) -> Result<Self, RuntimeError> {
+    pub(crate) fn record(paths: impl IntoIterator<Item = PathBuf>) -> Result<Self, RuntimeError> {
         let mut files = Vec::new();
-        for path in state_store_paths(config) {
+        for path in paths {
             files.push(StoreFile {
                 identity: identify(&path)?,
                 header_reader: open_header_reader(&path)?,
@@ -103,16 +101,6 @@ impl StateStore {
         let message = self.lost.get_or_init(|| fatal_message(path, detail));
         RuntimeError::StateStoreLost(message.clone())
     }
-}
-
-/// The SQLite files this runtime keeps engine state in: the store beside the
-/// config, plus the learned-statistics file when `FEDQ_STATS_CATALOG` points it
-/// somewhere else. A config with neither has no state store at all.
-fn state_store_paths(config: &Config) -> BTreeSet<PathBuf> {
-    let mut paths = BTreeSet::new();
-    paths.extend(crate::stats_sqlite_path(config));
-    paths.extend(crate::learned_catalog_path(config));
-    paths
 }
 
 /// The identity of a state file the runtime has just opened. It exists by now -
@@ -228,7 +216,6 @@ mod tests {
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use fq_common::Config;
     use rusqlite::Connection;
 
     use super::StateStore;
@@ -256,17 +243,8 @@ mod tests {
         writer
             .execute_batch(WAL_SETUP)
             .expect("initialize committed WAL state");
-        let config = guard_config(&directory);
-        let guard = StateStore::record(&config).expect("record state-file identity");
+        let guard = StateStore::record([path.clone()]).expect("record state-file identity");
         (directory, path, writer, guard)
-    }
-
-    /// Load a minimal real config that names this sandbox's state store.
-    fn guard_config(directory: &Path) -> Config {
-        let path = directory.join("config.yaml");
-        std::fs::write(&path, "datasources: {}\n").expect("write guard config");
-        fq_common::load_config(path.to_str().expect("config path is UTF-8"))
-            .expect("load guard config")
     }
 
     /// Read and close SQLite in another process, exercising its last-close checkpoint.

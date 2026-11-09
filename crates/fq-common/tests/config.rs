@@ -302,6 +302,7 @@ fn test_server_section_parses_users() {
     let config_yaml = "
 datasources: {}
 server:
+  auth: scram
   users:
     - name: alice
       verifier: SCRAM-SHA-256$4096:c2FsdA==$AAAA:BBBB
@@ -346,6 +347,7 @@ fn test_server_user_unknown_key_raises() {
     let config_yaml = "
 datasources: {}
 server:
+  auth: scram
   users:
     - name: alice
       verifier: SCRAM-SHA-256$4096:c2FsdA==$AAAA:BBBB

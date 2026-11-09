@@ -408,6 +408,7 @@ impl Converter<'_> {
             input: Box::new(aggregate),
             alias,
             column_names: None,
+            origin: fq_plan::SubqueryOrigin::Derived,
         });
         let (input, outputs) = self.expand_select_unnests(input, outputs)?;
         // This is a new projection restoring the parsed SELECT expressions after expansion.

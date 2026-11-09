@@ -18,6 +18,7 @@ pub mod error;
 pub mod expr;
 pub mod functions;
 mod nested;
+pub mod relation_names;
 pub mod statement;
 mod window;
 

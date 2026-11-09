@@ -22,6 +22,9 @@ use crate::schema::{Column, Schema, Table};
 pub struct ViewDef {
     pub sql: String,
     pub column_aliases: Option<Vec<String>>,
+    /// The stored relation identity authorization checks, or None for an
+    /// ad-hoc definition that was never published in a database catalog.
+    pub access: Option<fq_common::database::StoredRelationRef>,
 }
 
 /// Central catalog managing metadata from all data sources.
@@ -37,6 +40,9 @@ pub struct Catalog {
     // Non-materialized views by name, expanded in place by the parser when an
     // unqualified reference names one.
     views: BTreeMap<String, ViewDef>,
+    // Stored relations (materialized views) by their real catalog qualifier,
+    // so authorization checks their durable identity instead of a source name.
+    stored_relations: BTreeMap<(String, String, String), fq_common::database::RelationId>,
     // Datasources that failed to connect/load at construction, mapped to the
     // real connector error. Not registered as sources (nothing resolves them
     // silently), but a QUALIFIED reference to one raises the stored error naming
@@ -77,6 +83,40 @@ impl Catalog {
     /// Remove a view. Returns whether it was registered.
     pub fn remove_view(&mut self, name: &str) -> bool {
         self.views.remove(name).is_some()
+    }
+
+    /// Record which durable relation a catalog table's stored result is.
+    pub fn register_stored_relation(
+        &mut self,
+        datasource: &str,
+        schema: &str,
+        table: &str,
+        relation: fq_common::database::RelationId,
+    ) {
+        self.stored_relations.insert(
+            (
+                datasource.to_string(),
+                schema.to_string(),
+                table.to_string(),
+            ),
+            relation,
+        );
+    }
+
+    /// The durable relation behind a catalog table, when it is a stored result.
+    pub fn stored_relation(
+        &self,
+        datasource: &str,
+        schema: &str,
+        table: &str,
+    ) -> Option<fq_common::database::RelationId> {
+        self.stored_relations
+            .get(&(
+                datasource.to_string(),
+                schema.to_string(),
+                table.to_string(),
+            ))
+            .copied()
     }
 
     /// Every registered view name, sorted.
@@ -137,6 +177,11 @@ impl Catalog {
     ) {
         self.schemas
             .insert((datasource.into(), schema_name.into()), schema);
+    }
+
+    /// Enumerate loaded schema identities, including schemas containing no tables.
+    pub fn schema_names(&self) -> Vec<(String, String)> {
+        self.schemas.keys().cloned().collect()
     }
 
     /// Get a schema by data source and name.

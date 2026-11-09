@@ -15,6 +15,9 @@ use thiserror::Error;
 /// fall back to defaults).
 #[derive(Debug, Error)]
 pub enum ConfigError {
+    /// Credentials may only be configured with explicit SCRAM authentication.
+    #[error("server.users requires server.auth = scram")]
+    BootstrapUsersWithTrust,
     /// The config path does not exist. Mirrors Python's `FileNotFoundError`.
     #[error("Config file not found: {0}")]
     FileNotFound(String),

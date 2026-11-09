@@ -28,6 +28,7 @@ fn catalog_with_view(name: &str, sql: &str, aliases: Option<Vec<String>>) -> Cat
         ViewDef {
             sql: sql.into(),
             column_aliases: aliases,
+            access: None,
         },
     );
     c

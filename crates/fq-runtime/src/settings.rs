@@ -883,17 +883,16 @@ impl Runtime {
         let value = (def.default)()
             .parse_like(raw_value)
             .map_err(RuntimeError::from)?;
-        {
-            let mut config = self.config.write().expect("config lock poisoned");
-            apply(&mut config, &value)?;
+        // Validate against a clone, persist, and only then swap the live
+        // config: a failed metadata write must not leave a success-like
+        // session state behind.
+        let mut next = self.config_snapshot();
+        apply(&mut next, &value)?;
+        if let Some(catalog) = &self.database_catalog {
+            catalog.upsert_setting(name, raw_value)?;
         }
+        *self.config.write().expect("config lock poisoned") = next;
         self.settings_overrides_mut().insert(name.to_string());
-        // A store-backed runtime persists the override, so the setting
-        // survives restart (a new runtime re-applies it at construction); a
-        // path-less runtime has no store and the SET stays session-scoped.
-        if let Some(accel) = &self.accelerator {
-            accel.upsert_setting(name, raw_value)?;
-        }
         status_result("SET")
     }
 
@@ -941,25 +940,24 @@ impl Runtime {
         let apply = def.apply.ok_or_else(|| SettingsError::Static {
             name: name.to_string(),
         })?;
-        {
-            let mut config = self.config.write().expect("config lock poisoned");
-            apply(&mut config, &(def.default)())?;
+        let mut next = self.config_snapshot();
+        apply(&mut next, &(def.default)())?;
+        if let Some(catalog) = &self.database_catalog {
+            catalog.delete_setting(name)?;
         }
+        *self.config.write().expect("config lock poisoned") = next;
         self.settings_overrides_mut().remove(name);
-        if let Some(accel) = &self.accelerator {
-            accel.delete_setting(name)?;
-        }
         status_result("RESET")
     }
 
     /// Restore every session-mutable setting that was SET back to its default.
     fn reset_all(&self) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
+        if let Some(catalog) = &self.database_catalog {
+            catalog.clear_settings()?;
+        }
         let names: Vec<String> = self.settings_overrides().iter().cloned().collect();
         for name in &names {
             self.reset_one(name)?;
-        }
-        if let Some(accel) = &self.accelerator {
-            accel.clear_settings()?;
         }
         status_result("RESET")
     }

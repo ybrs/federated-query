@@ -92,12 +92,8 @@ fn a_query_past_the_limit_raises_naming_its_depth() {
         let depth = parsed_depth(&sql);
         assert!(depth > MAX_PLAN_DEPTH);
         let error = bind_sql(&sql).expect_err("a plan past the depth limit must raise");
-        assert_eq!(
-            error,
-            BindError::PlanTooDeep {
-                depth,
-                limit: MAX_PLAN_DEPTH
-            }
+        assert!(
+            matches!(error, BindError::PlanTooDeep { depth: actual, limit } if actual == depth && limit == MAX_PLAN_DEPTH)
         );
         assert_eq!(
             error.to_string(),

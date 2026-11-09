@@ -205,19 +205,49 @@ dispatched by `fq-runtime`:
   the live session; a bad value or an unknown name raises, with a nearest-name
   suggestion.
 
+## Databases and catalog ownership
+
+A storage root holds one server catalog and one directory per database:
+
+```
+<storage-root>/
+  server.sqlite                  users, database registry, CONNECT/ADMIN grants
+  databases/<database-id>/       metadata.sqlite, materialized/, scratch/
+```
+
+`fq-catalog::store::ServerCatalog` owns identities, the database registry,
+and database CONNECT/ADMIN grants. `fq-catalog::store::DatabaseCatalog`,
+bound to one database, owns datasource definitions, SQL views, settings,
+the shared local relation namespace (views and materialized views -
+one name, one durable identity), and local SELECT
+grants keyed by that identity. fq-accel retains only materialized-result
+storage and refresh mechanics. Database names never become path components;
+directories are formed from never-reused database IDs.
+
+Every connection (wire, CLI `--database`, Python `Runtime(path, database=)`)
+selects one database before any query runs; `main` is bootstrapped
+automatically and YAML datasources seed into `main` only. Statement
+authority is exhaustive: server administration (databases, global users,
+connector provisioning) requires a global superuser; local management
+requires the selected database's ADMIN; reads require CONNECT plus object
+SELECT. Authorization is refreshed from coherent server/local generation
+snapshots at every statement, so revocation takes effect on an already-open
+session's next statement.
+
 ## The materialized-view store
 
 Materialized views (fq-accel) sit on top of the core engine. The design is
 three parts:
 
 1. A REGISTRY over a persisted result. The engine computes a view's result once
-   and persists it; a lightweight registry beside the learned-stats SQLite
-   (`<config>.stats.sqlite`) records the view name, its defining SQL, the
+   and persists it; a lightweight registry in the selected database's
+   `metadata.sqlite` records the view name, its defining SQL, the
    ordered chunk list (the source of truth for which files compose the view -
    never a directory listing), the schema, timestamps, per-base-table source
    tokens, and the delta watermark.
 2. A STORAGE CONTRACT. fq-accel's `ChunkStore` writes framed Arrow IPC chunks
-   under `<config>.mv/` through the `object_store` abstraction, so the local
+   under the database's `materialized/` directory through the `object_store`
+   abstraction, so the local
    filesystem backend can become an S3 bucket by configuration with no change
    to the chunk model.
 3. USER-CONTROLLED FRESHNESS. Nothing on the query path checks the sources.

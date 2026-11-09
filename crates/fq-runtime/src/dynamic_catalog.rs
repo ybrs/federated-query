@@ -18,7 +18,7 @@ use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema, SchemaRef};
 use serde_yaml::Value;
 
-use fq_accel::DynamicDatasource;
+use fq_catalog::store::DatasourceDefinition;
 use fq_catalog::Catalog;
 use fq_common::{Config, DataSourceConfig, DataType};
 use fq_exec::connectors;
@@ -188,38 +188,44 @@ fn probe_connect_and_load(
 pub(crate) fn install_persisted_datasources(
     session: connectors::SessionId,
     catalog: &mut Catalog,
-    persisted: &[DynamicDatasource],
+    persisted: &[DatasourceDefinition],
     timeout_ms: u64,
 ) {
     for row in persisted {
-        let ds = datasource_config(&row.name, &row.kind, &row.params);
-        match probe_validate(session, &ds, timeout_ms) {
-            Ok(probe) => catalog.take_datasource_from(&probe, &row.name),
-            Err(error) => catalog.mark_unavailable(row.name.clone(), error.to_string()),
+        let ds = &row.definition;
+        match probe_validate(session, ds, timeout_ms) {
+            Ok(probe) => catalog.take_datasource_from(&probe, &ds.name),
+            Err(error) => catalog.mark_unavailable(ds.name.clone(), error.to_string()),
         }
     }
 }
 
-/// Raise when a name is defined in BOTH the YAML config and the persisted
-/// dynamic catalog: the two rows may carry different params, so there is no
-/// correct source to pick and construction refuses rather than guess.
-pub(crate) fn reject_bootstrap_collision(
+/// Seed the YAML datasource definitions into the selected database's catalog
+/// so the database carries its complete source definitions, not just the
+/// config file. An existing definition with the same name must be identical:
+/// a config change never silently replaces a stored source.
+pub(crate) fn seed_bootstrap_datasources(
     config: &Config,
-    persisted: &[DynamicDatasource],
+    definitions: &fq_catalog::store::DatabaseCatalog,
 ) -> Result<(), RuntimeError> {
-    for row in persisted {
-        let collides = config
-            .datasources
-            .keys()
-            .any(|name| name.eq_ignore_ascii_case(&row.name));
-        if collides {
-            return Err(RuntimeError::Config(format!(
-                "datasource '{}' is defined in BOTH the config file and the persisted \
-                 dynamic catalog; remove one (drop the dynamic source or delete the \
-                 YAML block)",
-                row.name
-            )));
+    for datasource in config.datasources.values() {
+        if let Some(existing) = definitions.get_datasource(&datasource.name)? {
+            let stored = &existing.definition;
+            if stored.ty != datasource.ty || stored.config != datasource.config {
+                return Err(RuntimeError::Config(format!(
+                    "datasource '{}' is already stored in this database with a \
+                     different connection definition; the config file cannot replace it",
+                    datasource.name
+                )));
+            }
+            // Declaration fields (capabilities, change keys) are provisioned
+            // by the config file, so a changed declaration updates the copy.
+            if *stored != *datasource {
+                definitions.update_datasource(datasource)?;
+            }
+            continue;
         }
+        definitions.insert_datasource(datasource)?;
     }
     Ok(())
 }
@@ -237,7 +243,7 @@ impl Runtime {
         kind: &str,
         params: &[(String, String)],
     ) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
-        let accel = self.accelerator()?;
+        let definitions = self.database_catalog()?;
         validate_params(name, kind, params)?;
         if self.catalog_snapshot().get_datasource(name).is_some() {
             return Err(RuntimeError::Config(format!(
@@ -248,7 +254,7 @@ impl Runtime {
         let ds = datasource_config(name, kind, &stored);
         let timeout = self.config_snapshot().catalog.create_connect_timeout_ms;
         let probe = probe_validate(self.session, &ds, timeout)?;
-        self.persist_and_install(accel, name, kind, &stored, &probe)?;
+        self.persist_and_install(definitions, &ds, &probe)?;
         status_result("CREATE DATASOURCE")
     }
 
@@ -257,27 +263,18 @@ impl Runtime {
     /// validated connection and raise `already exists`.
     fn persist_and_install(
         &self,
-        accel: &fq_accel::Accelerator,
-        name: &str,
-        kind: &str,
-        stored: &BTreeMap<String, String>,
+        definitions: &fq_catalog::store::DatabaseCatalog,
+        ds: &DataSourceConfig,
         probe: &Catalog,
     ) -> Result<(), RuntimeError> {
-        // A row assembled to persist the validated source; `created_at` is
-        // stamped by the registry on insert, so the placeholder is never read.
-        let row = DynamicDatasource {
-            name: name.to_string(),
-            kind: kind.to_string(),
-            params: stored.clone(),
-            created_at: String::new(),
-        };
-        if !accel.insert_datasource(&row)? {
-            connectors::deregister(self.session, name);
+        if !definitions.insert_datasource(ds)? {
+            connectors::deregister(self.session, &ds.name);
             return Err(RuntimeError::Config(format!(
-                "CREATE DATASOURCE: '{name}' already exists"
+                "CREATE DATASOURCE: '{}' already exists",
+                ds.name
             )));
         }
-        self.install_datasource(probe, name);
+        self.install_datasource(probe, &ds.name);
         Ok(())
     }
 
@@ -302,8 +299,19 @@ impl Runtime {
         &self,
         name: &str,
     ) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
-        let accel = self.accelerator()?;
-        if accel.get_datasource(name)?.is_none() {
+        let definitions = self.database_catalog()?;
+        // A bootstrap source is seeded into the catalog too, but it is owned
+        // by the config file: dropping it here would resurrect it on the next
+        // construction, so it raises the remove-from-YAML error.
+        let is_bootstrap = self
+            .config_snapshot()
+            .datasources
+            .keys()
+            .any(|configured| configured.eq_ignore_ascii_case(name));
+        if is_bootstrap {
+            return Err(self.drop_missing_error(name));
+        }
+        if definitions.get_datasource(name)?.is_none() {
             return Err(self.drop_missing_error(name));
         }
         let dependents = self.views_referencing(name)?;
@@ -317,7 +325,7 @@ impl Runtime {
         if let Some(learned) = &self.learned {
             learned.purge_datasource(name)?;
         }
-        accel.delete_datasource(name)?;
+        definitions.delete_datasource(name)?;
         connectors::deregister(self.session, name);
         self.uninstall_datasource(name);
         status_result("DROP DATASOURCE")
@@ -349,11 +357,10 @@ impl Runtime {
     /// definition no longer binds, a conservative textual check on the
     /// qualifier keeps the drop from orphaning a dependent view.
     fn views_referencing(&self, name: &str) -> Result<Vec<String>, RuntimeError> {
-        let accel = self.accelerator()?;
         let catalog = self.catalog_snapshot();
         let config = self.config_snapshot();
         let mut dependents = Vec::new();
-        for view in accel.views()? {
+        for view in self.accelerator()?.views()? {
             if view_reads_datasource(&catalog, &config, &view.definition_sql, name) {
                 dependents.push(view.name.clone());
             }
@@ -382,7 +389,15 @@ impl Runtime {
         for datasource in self.config_snapshot().datasources.values() {
             rows.push_bootstrap(datasource);
         }
-        for row in self.accelerator()?.list_datasources()? {
+        let bootstrap: Vec<String> = self.config_snapshot().datasources.keys().cloned().collect();
+        for row in self.database_catalog()?.list_datasources()? {
+            // A seeded bootstrap definition is already shown as bootstrap.
+            if bootstrap
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(&row.definition.name))
+            {
+                continue;
+            }
             rows.push_dynamic(&row);
         }
         rows.sort_by_name();
@@ -427,18 +442,6 @@ fn summary_from_config(config: &BTreeMap<String, Value>) -> String {
             if let Some(rendered) = render_config_value(value) {
                 parts.push(format!("{key}={rendered}"));
             }
-        }
-    }
-    parts.join(" ")
-}
-
-/// The fail-closed redacted summary of the persisted string params: only
-/// allowlisted keys, each rendered as `key=value`.
-fn summary_from_params(params: &BTreeMap<String, String>) -> String {
-    let mut parts = Vec::new();
-    for key in SAFE_DISPLAY_KEYS {
-        if let Some(value) = params.get(key) {
-            parts.push(format!("{key}={value}"));
         }
     }
     parts.join(" ")
@@ -509,11 +512,12 @@ impl DatasourceRows {
 
     /// Append one dynamic (persisted) source: origin `dynamic`, its stored
     /// creation time.
-    fn push_dynamic(&mut self, row: &DynamicDatasource) {
-        self.names.push(row.name.clone());
-        self.types.push(row.kind.clone());
+    fn push_dynamic(&mut self, row: &DatasourceDefinition) {
+        self.names.push(row.definition.name.clone());
+        self.types.push(row.definition.ty.clone());
         self.origins.push("dynamic".to_string());
-        self.summaries.push(summary_from_params(&row.params));
+        self.summaries
+            .push(summary_from_config(&row.definition.config));
         self.created.push(row.created_at.clone());
     }
 
@@ -554,22 +558,6 @@ fn reorder(values: &[String], order: &[usize]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A persisted param summary emits only allowlisted keys; a password is
-    /// dropped even though it is present.
-    #[test]
-    fn summary_is_fail_closed() {
-        let mut params = BTreeMap::new();
-        params.insert("host".to_string(), "h1".to_string());
-        params.insert("port".to_string(), "5432".to_string());
-        params.insert("password".to_string(), "secret".to_string());
-        params.insert("user".to_string(), "sam".to_string());
-        let summary = summary_from_params(&params);
-        assert!(summary.contains("host=h1"));
-        assert!(summary.contains("port=5432"));
-        assert!(!summary.contains("secret"));
-        assert!(!summary.contains("sam"));
-    }
 
     /// The YAML summary renders a schemas sequence comma-joined and never a
     /// non-allowlisted key.

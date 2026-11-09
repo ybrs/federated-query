@@ -68,7 +68,6 @@ use fq_accel::{MaterializedView, VIEW_SCHEMA_NAME};
 use fq_catalog::Catalog;
 use fq_common::Config;
 use fq_optimize::{build_optimizer, CostModel, OptimizeError};
-use fq_parse::parse_with_catalog;
 use fq_plan::logical::{LogicalPlan, Scan};
 
 use crate::error::RuntimeError;
@@ -127,7 +126,9 @@ impl Runtime {
     /// normalized through the same pipeline the incoming query used. A view
     /// whose definition no longer plans (a base table was dropped since it was
     /// created) is not a candidate - the incoming query does not depend on it,
-    /// so declining to match it is correct, not a swallowed query error.
+    /// so declining to match it is correct, not a swallowed query error. A
+    /// view is also ineligible when the caller may not SELECT the stored
+    /// result.
     fn build_candidates(
         &self,
         views: Vec<MaterializedView>,
@@ -136,11 +137,27 @@ impl Runtime {
     ) -> Vec<Candidate> {
         let mut candidates = Vec::with_capacity(views.len());
         for view in views {
+            if !self.can_select_materialized_view(catalog, &view) {
+                continue;
+            }
             if let Ok(canonical) = self.optimize_definition(catalog, &view.definition_sql, config) {
                 candidates.push(Candidate { view, canonical });
             }
         }
         candidates
+    }
+
+    /// Whether the caller may SELECT this view's stored result by identity.
+    fn can_select_materialized_view(&self, catalog: &Catalog, view: &MaterializedView) -> bool {
+        let Some(accel) = self.accelerator.as_ref() else {
+            return false;
+        };
+        let Some(relation) =
+            catalog.stored_relation(accel.datasource_name(), VIEW_SCHEMA_NAME, &view.name)
+        else {
+            return false;
+        };
+        self.can_select_object(&fq_common::security::ObjectKey::MaterializedView { relation })
     }
 
     /// Normalize a view's defining SELECT into its canonical optimized logical
@@ -154,8 +171,7 @@ impl Runtime {
         sql: &str,
         config: &Config,
     ) -> Result<LogicalPlan, RuntimeError> {
-        let parsed = parse_with_catalog(sql, catalog)?;
-        let bound = fq_bind::bind(catalog, parsed)?;
+        let bound = self.bind_definition(catalog, sql)?;
         let decorrelated = fq_decorrelate::decorrelate(bound)?;
         let optimizer = build_optimizer(&config.optimizer, self.cost_model(config));
         Ok(optimizer.optimize(decorrelated)?)

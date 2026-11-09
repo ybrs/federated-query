@@ -1,7 +1,7 @@
 //! User and access-control DDL, bind-time enforcement, and the live grant cache.
 //!
 //! `CREATE/ALTER/DROP USER`, `GRANT`/`REVOKE`, and `SHOW USERS`/`SHOW GRANTS`
-//! persist into the accelerator's durable store (the `users`/`grants`/`acl_meta`
+//! persist into the identity catalog (the `users`/`grants`/`acl_meta`
 //! tables). Every base-table reference is authorized at BIND time through the one
 //! resolver (`fq_bind::resolve_scan_table`): a non-superuser without a covering
 //! grant gets a non-leaking not-found, indistinguishable from a missing table at
@@ -20,8 +20,10 @@ use std::sync::Arc;
 use arrow::array::{RecordBatch, StringArray};
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema, SchemaRef};
 
-use fq_accel::{Accelerator, Grant};
-use fq_common::{DataType, Principal, UserCredential};
+use fq_catalog::store::{Grant, ServerCatalog};
+use fq_common::database::{PrincipalId, RelationKind};
+use fq_common::security::{AuthMode, DatabasePrivilege, GrantSubject, ObjectKey};
+use fq_common::{DataType, UserCredential};
 use fq_parse::{GrantObject, Statement};
 use fq_scram::Verifier;
 
@@ -29,108 +31,99 @@ use crate::error::RuntimeError;
 use crate::materialized::status_result;
 use crate::Runtime;
 
-/// The single grantable privilege in v1: the engine is read-only over sources,
-/// so SELECT is the only meaningful data privilege.
-const SELECT: &str = "SELECT";
-
 /// The reserved pseudo-grantee that authorizes every authenticated user. It
 /// cannot be created, altered, dropped, or logged into (it has no verifier).
 const PUBLIC: &str = "PUBLIC";
 
-/// This runtime's cached authorization state. `enforce` is false for the
-/// embedded / trust-mode build (an implicit superuser), true only for a wire
-/// principal under configured auth. The cached `paths` are the lowercased object
-/// paths the principal and PUBLIC hold SELECT on, valid while `generation`
-/// matches the store's counter.
+/// Live identity and database-local permissions, invalidated independently by each store.
 pub(crate) struct AclState {
-    /// The authenticated principal name; `None` for the embedded process.
     principal_name: Option<String>,
-    /// The effective superuser flag: true for embedded/trust, else the store's
-    /// authoritative value (never trusted from the wire), refreshed live.
+    principal_id: Option<PrincipalId>,
     superuser: bool,
-    /// Whether bind-time grant checks are enforced for this runtime.
+    database_admin: bool,
     enforce: bool,
-    /// The ACL generation the cached `paths`/`superuser` were loaded at.
-    generation: i64,
-    /// The lowercased object paths (datasource | d.s | d.s.t) the principal and
-    /// PUBLIC hold SELECT on. Empty until first load.
-    paths: HashSet<String>,
+    root_generation: i64,
+    local_generation: i64,
+    objects: HashSet<ObjectKey>,
 }
 
 impl AclState {
-    /// The embedded default: an implicit superuser with enforcement off. A wire
-    /// connection later calls `set_principal` to enable enforcement.
+    /// Embedded callers have explicit process-owner authority.
     pub(crate) fn embedded() -> Self {
         Self {
             principal_name: None,
+            principal_id: None,
             superuser: true,
+            database_admin: true,
             enforce: false,
-            // -1 forces a reload the first time enforcement turns on.
-            generation: -1,
-            paths: HashSet::new(),
+            root_generation: -1,
+            local_generation: -1,
+            objects: HashSet::new(),
         }
     }
 }
 
-/// A snapshot of the authorization state a single bind consults: the effective
-/// superuser flag and the held object paths, plus the principal name for the
-/// denied-access audit line.
+/// One bind's exact structured SELECT permissions and audit identity.
 pub(crate) struct RuntimeAuthorizer {
     principal: String,
-    paths: HashSet<String>,
+    objects: HashSet<ObjectKey>,
 }
 
 impl fq_bind::Authorizer for RuntimeAuthorizer {
-    /// Authorize a resolved base table by its REAL qualifier: the principal (or
-    /// PUBLIC) holds SELECT iff a covering grant exists at ANY of the table's
-    /// three containment levels. A denial writes the true reason to the audit
-    /// log; the binder raises a non-leaking not-found to the client.
+    /// Match real catalog components without flattening identifiers into dotted strings.
     fn authorize_select(&self, datasource: &str, schema: &str, table: &str) -> bool {
         let candidates = [
-            datasource.to_lowercase(),
-            format!("{datasource}.{schema}").to_lowercase(),
-            format!("{datasource}.{schema}.{table}").to_lowercase(),
+            ObjectKey::Datasource {
+                datasource: datasource.to_string(),
+            },
+            ObjectKey::Schema {
+                datasource: datasource.to_string(),
+                schema: schema.to_string(),
+            },
+            ObjectKey::Table {
+                datasource: datasource.to_string(),
+                schema: schema.to_string(),
+                table: table.to_string(),
+            },
         ];
-        let authorized = candidates.iter().any(|path| self.paths.contains(path));
+        let authorized = candidates
+            .iter()
+            .any(|object| self.objects.contains(object));
         if !authorized {
-            tracing::warn!(
-                target: "fedq::audit",
-                actor = %self.principal,
-                object = %format!("{datasource}.{schema}.{table}"),
-                "denied SELECT"
-            );
+            tracing::warn!(target: "fedq::audit", actor = %self.principal,
+                object = %format!("{datasource}.{schema}.{table}"), "denied SELECT");
+        }
+        authorized
+    }
+
+    /// Match one stored relation's durable identity in the grant set.
+    fn authorize_object(&self, object: &ObjectKey) -> bool {
+        let authorized = self.objects.contains(object);
+        if !authorized {
+            tracing::warn!(target: "fedq::audit", actor = %self.principal,
+                object = %object.label(), "denied SELECT");
         }
         authorized
     }
 }
 
-/// Import the config's bootstrap users into the persisted store (idempotent
-/// `INSERT OR IGNORE`, stamped `bootstrap-import`). Each verifier is validated as
-/// well-formed pg_authid before storing, so a malformed config credential fails
-/// loudly at import rather than at a login. Thereafter the persisted table is
-/// authoritative and the config list is only the seed.
+/// Validate credential syntax and atomically seed the authoritative identity store once.
 pub fn import_bootstrap_users(
-    accel: &Accelerator,
+    identities: &ServerCatalog,
     users: &[UserCredential],
 ) -> Result<(), RuntimeError> {
     for user in users {
-        Verifier::parse(&user.verifier)
-            .map_err(|error| RuntimeError::Acl(format!("server user '{}': {error}", user.name)))?;
+        Verifier::parse(&user.verifier)?;
         reject_reserved_name(&user.name)?;
-        accel.create_user(
-            &user.name,
-            &user.verifier,
-            user.superuser,
-            "bootstrap-import",
-        )?;
     }
+    identities.seed_users(users)?;
     Ok(())
 }
 
 /// Refuse a server startup where auth is enabled but no user is a superuser: no
 /// principal could administer grants, so the safe default is a loud refusal.
-pub fn require_a_superuser(accel: &Accelerator) -> Result<(), RuntimeError> {
-    if accel.count_superusers()? == 0 {
+pub fn require_a_superuser(identities: &ServerCatalog) -> Result<(), RuntimeError> {
+    if identities.count_superusers()? == 0 {
         return Err(RuntimeError::Acl(
             "authentication is enabled but no user is a superuser; no principal could \
              administer grants (define an administrator with hash-password --superuser)"
@@ -152,93 +145,148 @@ fn reject_reserved_name(name: &str) -> Result<(), RuntimeError> {
     Ok(())
 }
 
-/// The admin statements gated behind the superuser flag, with the action name
-/// for the permission-denied message; `None` for any statement any user may run.
-pub(crate) fn superuser_action(statement: &Statement) -> Option<&'static str> {
+/// The authority required before dispatch, exhaustively classified by statement kind.
+pub(crate) fn statement_authority(statement: &Statement) -> Authority {
     match statement {
-        Statement::CreateUser { .. } => Some("CREATE USER"),
-        Statement::AlterUserPassword { .. } | Statement::AlterUserSuperuser { .. } => {
-            Some("ALTER USER")
-        }
-        Statement::DropUser { .. } => Some("DROP USER"),
-        Statement::Grant { .. } => Some("GRANT"),
-        Statement::Revoke { .. } => Some("REVOKE"),
-        Statement::ShowUsers => Some("SHOW USERS"),
-        Statement::CreateDatasource { .. } => Some("CREATE DATASOURCE"),
-        Statement::DropDatasource { .. } => Some("DROP DATASOURCE"),
-        Statement::CreateMaterializedView { .. } => Some("CREATE MATERIALIZED VIEW"),
-        Statement::RefreshMaterializedView { .. } => Some("REFRESH MATERIALIZED VIEW"),
-        Statement::DropMaterializedView { .. } => Some("DROP MATERIALIZED VIEW"),
-        _ => None,
+        Statement::CreateDatabase { .. }
+        | Statement::DropDatabase { .. }
+        | Statement::CreateUser { .. }
+        | Statement::AlterUserPassword { .. }
+        | Statement::AlterUserSuperuser { .. }
+        | Statement::DropUser { .. }
+        | Statement::ShowUsers
+        | Statement::CreateDatasource { .. }
+        | Statement::DropDatasource { .. }
+        | Statement::GrantDatabase { .. }
+        | Statement::RevokeDatabase { .. } => Authority::Server,
+        Statement::CreateMaterializedView { .. }
+        | Statement::RefreshMaterializedView { .. }
+        | Statement::DropMaterializedView { .. }
+        | Statement::CreateView { .. }
+        | Statement::DropView { .. }
+        | Statement::Grant { .. }
+        | Statement::Revoke { .. }
+        | Statement::SetSetting { .. }
+        | Statement::ResetSetting { .. } => Authority::Database,
+        Statement::Query(_)
+        | Statement::ShowDatabases
+        | Statement::ShowViews
+        | Statement::ShowSettings
+        | Statement::ShowSetting { .. }
+        | Statement::ShowPushdownFragments
+        | Statement::ShowMaterializedViews
+        | Statement::ShowDatasources
+        | Statement::ShowTables { .. }
+        | Statement::DescribeTable { .. }
+        | Statement::ShowGrants { .. } => Authority::Read,
     }
 }
 
+/// Server administration and selected-database administration are separate authorities.
+pub(crate) enum Authority {
+    Read,
+    Database,
+    Server,
+}
+
 impl Runtime {
-    /// Set the authenticated wire principal for this runtime and turn on
-    /// enforcement when auth is configured. In trust mode (no configured users)
-    /// even a wire connection runs as an implicit superuser with enforcement off.
-    /// The superuser flag is resolved from the store (authoritative), never
-    /// trusted from the wire.
+    /// Bind a name to its current stable identity exactly once for this runtime.
     pub fn set_principal(&self, name: &str) -> Result<(), RuntimeError> {
-        // The superuser flag and grants are read from the state store, so a
-        // runtime whose store is gone cannot resolve a principal at all.
         self.state_store.check()?;
-        let auth_on = !self
-            .config
-            .read()
-            .expect("config lock poisoned")
-            .server
-            .users
-            .is_empty();
+        if self.config_snapshot().server.auth == AuthMode::Trust {
+            self.authz
+                .write()
+                .expect("authz lock poisoned")
+                .principal_name = Some(name.to_string());
+            return Ok(());
+        }
         {
             let mut state = self.authz.write().expect("authz lock poisoned");
-            state.principal_name = Some(name.to_string());
-            if !auth_on {
-                state.superuser = true;
-                state.enforce = false;
-                return Ok(());
-            }
             state.enforce = true;
-            // Force a reload on the next refresh so the store's superuser flag and
-            // grants are read fresh for the new principal.
-            state.generation = -1;
+            state.superuser = false;
+            state.database_admin = false;
+            state.root_generation = -1;
+        }
+        let user = self
+            .server_catalog()?
+            .get_user(name)?
+            .ok_or_else(identity_denied)?;
+        self.set_principal_by_id(user.id)
+    }
+
+    /// Bind the identity proven at startup without resolving a possibly reused name.
+    pub fn set_principal_by_id(&self, id: PrincipalId) -> Result<(), RuntimeError> {
+        self.state_store.check()?;
+        {
+            let mut state = self.authz.write().expect("authz lock poisoned");
+            if state.principal_id.is_some_and(|current| current != id) {
+                return Err(RuntimeError::PermissionDenied(
+                    "session identity is already bound".to_string(),
+                ));
+            }
+            state.principal_id = Some(id);
+            state.enforce = true;
+            state.superuser = false;
+            state.database_admin = false;
+            state.root_generation = -1;
         }
         self.refresh_acl()
     }
 
-    /// Reload the cached grant set and superuser flag if the store's generation
-    /// changed since the last load. A no-op when enforcement is off (embedded /
-    /// trust). Cost per query is one O(1) generation read, plus an occasional
-    /// bounded grant reload only when privileges actually changed.
+    /// Check independent root/local generations, then load coherent authorization snapshots.
     pub(crate) fn refresh_acl(&self) -> Result<(), RuntimeError> {
-        if !self.authz.read().expect("authz lock poisoned").enforce {
+        let state = self.authz.read().expect("authz lock poisoned");
+        if !state.enforce {
             return Ok(());
         }
-        let accel = self.accelerator()?;
-        let generation = accel.acl_generation()?;
-        if self.authz.read().expect("authz lock poisoned").generation == generation {
+        let principal = state.principal_id.ok_or_else(identity_denied)?;
+        let root_generation = self.server_catalog()?.acl_generation()?;
+        let local_generation = self.database_catalog()?.acl_generation()?;
+        if state.root_generation == root_generation && state.local_generation == local_generation {
             return Ok(());
         }
-        let name = self
-            .authz
-            .read()
-            .expect("authz lock poisoned")
-            .principal_name
-            .clone()
-            .unwrap_or_default();
-        let superuser = accel.get_user(&name)?.is_some_and(|user| user.superuser);
-        let mut paths = HashSet::new();
-        for grant in accel.grants_for(&name)? {
-            paths.insert(grant.object_path.to_lowercase());
-        }
-        for grant in accel.grants_for(PUBLIC)? {
-            paths.insert(grant.object_path.to_lowercase());
-        }
+        drop(state);
+        self.reload_access(principal)
+    }
+
+    /// Refresh stable identity, CONNECT/ADMIN and local SELECT grants as one cache replacement.
+    fn reload_access(&self, principal: PrincipalId) -> Result<(), RuntimeError> {
+        let database = self.database_lease.as_ref().ok_or_else(identity_denied)?;
+        let (root_generation, user, access) = self
+            .server_catalog()?
+            .authorization_snapshot(database.descriptor.id, principal)?;
+        let user = user.ok_or_else(identity_denied)?;
+        require_connect(&user, access)?;
+        let (local_generation, grants) = self
+            .database_catalog()?
+            .access_snapshot(GrantSubject::User(principal))?;
         let mut state = self.authz.write().expect("authz lock poisoned");
-        state.superuser = superuser;
-        state.paths = paths;
-        state.generation = generation;
+        state.principal_name = Some(user.name);
+        state.superuser = user.superuser;
+        state.database_admin = access == Some(DatabasePrivilege::Admin);
+        state.objects = grants.into_iter().map(|grant| grant.object).collect();
+        state.root_generation = root_generation;
+        state.local_generation = local_generation;
         Ok(())
+    }
+
+    /// Enforce the exact authority for a statement before inspecting its target objects.
+    pub(crate) fn authorize_statement(&self, statement: &Statement) -> Result<(), RuntimeError> {
+        self.refresh_acl()?;
+        let state = self.authz.read().expect("authz lock poisoned");
+        if state.superuser {
+            return Ok(());
+        }
+        match statement_authority(statement) {
+            Authority::Read => Ok(()),
+            Authority::Database if state.database_admin => Ok(()),
+            Authority::Database => Err(RuntimeError::PermissionDenied(
+                "database ADMIN required".to_string(),
+            )),
+            Authority::Server => Err(RuntimeError::PermissionDenied(
+                "server SUPERUSER required".to_string(),
+            )),
+        }
     }
 
     /// Bind `plan` under this runtime's live authorization: a superuser (or the
@@ -252,35 +300,49 @@ impl Runtime {
     ) -> Result<fq_plan::LogicalPlan, RuntimeError> {
         self.refresh_acl()?;
         let state = self.authz.read().expect("authz lock poisoned");
-        if !state.enforce || state.superuser {
-            drop(state);
-            return Ok(fq_bind::bind(catalog, plan)?);
-        }
-        let principal = Principal::user(state.principal_name.clone().unwrap_or_default(), false);
+        let superuser = !state.enforce || state.superuser || state.database_admin;
         let authorizer = RuntimeAuthorizer {
-            principal: principal.name.clone(),
-            paths: state.paths.clone(),
+            principal: state
+                .principal_name
+                .clone()
+                .unwrap_or_else(|| "embedded".to_string()),
+            objects: state.objects.clone(),
         };
         drop(state);
-        Ok(fq_bind::bind_as(catalog, plan, &principal, &authorizer)?)
+        Ok(fq_bind::bind_in_context(
+            catalog,
+            plan,
+            superuser,
+            &authorizer,
+        )?)
     }
 
-    /// Raise unless the current principal is a superuser (refreshed live), for the
-    /// admin-DDL dispatch gate. An explicit message is correct: the statement kind
-    /// is not a secret.
-    pub(crate) fn require_superuser(&self, action: &str) -> Result<(), RuntimeError> {
-        self.refresh_acl()?;
-        if self.authz.read().expect("authz lock poisoned").superuser {
-            return Ok(());
+    /// Consult the statement's current structured local SELECT permissions.
+    pub(crate) fn can_select_object(&self, object: &ObjectKey) -> bool {
+        let state = self.authz.read().expect("authz lock poisoned");
+        state.superuser || state.database_admin || state.objects.contains(object)
+    }
+
+    /// Filter database names using only server-owned admission rights.
+    pub(crate) fn can_connect_database(
+        &self,
+        database: fq_common::database::DatabaseId,
+    ) -> Result<bool, RuntimeError> {
+        let state = self.authz.read().expect("authz lock poisoned");
+        if state.superuser {
+            return Ok(true);
         }
-        Err(RuntimeError::PermissionDenied(format!(
-            "{action} requires superuser"
-        )))
+        let principal = state.principal_id.ok_or_else(identity_denied)?;
+        drop(state);
+        Ok(self
+            .server_catalog()?
+            .database_access(database, principal)?
+            .is_some())
     }
 
     /// The current principal name for the `granted_by`/`created_by` provenance and
     /// audit lines; the embedded process reports `embedded`.
-    fn actor(&self) -> String {
+    pub(crate) fn actor(&self) -> String {
         self.authz
             .read()
             .expect("authz lock poisoned")
@@ -309,11 +371,11 @@ impl Runtime {
         password: &str,
         superuser: bool,
     ) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
-        let accel = self.accelerator()?;
+        let identities = self.server_catalog()?;
         reject_reserved_name(name)?;
         let verifier = self.derive_verifier(password)?;
         let actor = self.actor();
-        if !accel.create_user(name, &verifier, superuser, &actor)? {
+        if !identities.create_user(name, &verifier, superuser, &actor)? {
             return Err(RuntimeError::Acl(format!(
                 "CREATE USER: user '{name}' already exists"
             )));
@@ -330,10 +392,10 @@ impl Runtime {
         name: &str,
         password: &str,
     ) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
-        let accel = self.accelerator()?;
+        let identities = self.server_catalog()?;
         reject_reserved_name(name)?;
         let verifier = self.derive_verifier(password)?;
-        if !accel.set_user_password(name, &verifier)? {
+        if !identities.set_user_password(name, &verifier)? {
             return Err(RuntimeError::Acl(format!(
                 "ALTER USER: user '{name}' does not exist"
             )));
@@ -350,9 +412,9 @@ impl Runtime {
         name: &str,
         superuser: bool,
     ) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
-        let accel = self.accelerator()?;
+        let identities = self.server_catalog()?;
         reject_reserved_name(name)?;
-        if !accel.set_user_superuser(name, superuser)? {
+        if !identities.set_user_superuser(name, superuser)? {
             return Err(RuntimeError::Acl(format!(
                 "ALTER USER: user '{name}' does not exist"
             )));
@@ -368,9 +430,9 @@ impl Runtime {
         &self,
         name: &str,
     ) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
-        let accel = self.accelerator()?;
+        let identities = self.server_catalog()?;
         reject_reserved_name(name)?;
-        if !accel.drop_user(name)? {
+        if !identities.drop_user(name)? {
             return Err(RuntimeError::Acl(format!(
                 "DROP USER: user '{name}' does not exist"
             )));
@@ -387,10 +449,10 @@ impl Runtime {
         object: &GrantObject,
         grantee: &str,
     ) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
-        let accel = self.accelerator()?;
-        require_grantee_exists(accel, grantee)?;
+        let subject = self.grant_subject(grantee)?;
+        let target = self.grant_target(object)?;
         let actor = self.actor();
-        accel.grant(grantee, SELECT, object.kind(), &object.path(), &actor)?;
+        self.database_catalog()?.grant(subject, &target, &actor)?;
         audit_grant("GRANT", &actor, grantee, object);
         status_result("GRANT")
     }
@@ -402,12 +464,11 @@ impl Runtime {
         object: &GrantObject,
         grantee: &str,
     ) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
-        let accel = self.accelerator()?;
-        if !accel.revoke(grantee, SELECT, object.kind(), &object.path())? {
+        let subject = self.grant_subject(grantee)?;
+        let target = self.grant_target(object)?;
+        if !self.database_catalog()?.revoke(subject, &target)? {
             return Err(RuntimeError::Acl(format!(
-                "no such grant to revoke: SELECT ON {} {} FROM {grantee}",
-                object.kind().to_uppercase(),
-                object.path()
+                "no such SELECT grant to revoke from {grantee}"
             )));
         }
         audit_grant("REVOKE", &self.actor(), grantee, object);
@@ -417,7 +478,7 @@ impl Runtime {
     /// `SHOW USERS`: one row per user (name, superuser, created). The verifier is
     /// NEVER a column (fail-closed allowlist). Superuser-gated at dispatch.
     pub(crate) fn show_users(&self) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
-        let users = self.accelerator()?.list_users()?;
+        let users = self.server_catalog()?.list_users()?;
         let mut names = Vec::with_capacity(users.len());
         let mut superusers = Vec::with_capacity(users.len());
         let mut created = Vec::with_capacity(users.len());
@@ -448,34 +509,93 @@ impl Runtime {
     ) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
         self.refresh_acl()?;
         let grants = self.collect_grants(grantee)?;
-        grants_batch(&grants)
+        self.grants_batch(&grants)
     }
 
     /// Gather the grant rows a SHOW GRANTS should return, enforcing that a
     /// non-superuser only sees their own access.
     fn collect_grants(&self, grantee: Option<&str>) -> Result<Vec<Grant>, RuntimeError> {
-        let accel = self.accelerator()?;
-        let (superuser, name) = {
-            let state = self.authz.read().expect("authz lock poisoned");
-            (
-                state.superuser,
-                state.principal_name.clone().unwrap_or_default(),
-            )
-        };
-        match grantee {
+        let state = self.authz.read().expect("authz lock poisoned");
+        let administrator = state.superuser || state.database_admin;
+        let name = state.principal_name.clone();
+        let subject = state.principal_id.map(GrantSubject::User);
+        drop(state);
+        let target = match grantee {
             Some(target) => {
-                if !superuser && !target.eq_ignore_ascii_case(&name) && target != PUBLIC {
+                if !administrator && Some(target) != name.as_deref() && target != PUBLIC {
                     return Err(RuntimeError::PermissionDenied(
-                        "SHOW GRANTS FOR another principal requires superuser".to_string(),
+                        "SHOW GRANTS for another user requires database ADMIN".to_string(),
                     ));
                 }
-                Ok(accel.grants_for(target)?)
+                Some(self.grant_subject(target)?)
             }
-            None if superuser => Ok(accel.list_grants()?),
-            None => {
-                let mut grants = accel.grants_for(&name)?;
-                grants.extend(accel.grants_for(PUBLIC)?);
-                Ok(grants)
+            None if administrator => None,
+            None => subject,
+        };
+        Ok(self.database_catalog()?.list_grants(target)?)
+    }
+
+    /// Resolve a grantee to its stable identity, reserving PUBLIC as a separate subject.
+    pub(crate) fn grant_subject(&self, name: &str) -> Result<GrantSubject, RuntimeError> {
+        if name == PUBLIC {
+            return Ok(GrantSubject::Public);
+        }
+        let user = self
+            .server_catalog()?
+            .get_user(name)?
+            .ok_or_else(|| RuntimeError::Acl(format!("user '{name}' does not exist")))?;
+        Ok(GrantSubject::User(user.id))
+    }
+
+    /// Resolve a local source target to the same real components consulted by the binder.
+    fn grant_target(&self, object: &GrantObject) -> Result<ObjectKey, RuntimeError> {
+        let catalog = self.catalog_snapshot();
+        match object {
+            GrantObject::View(name) => self.relation_grant_target(name, RelationKind::View),
+            GrantObject::MaterializedView(name) => {
+                self.relation_grant_target(name, RelationKind::MaterializedView)
+            }
+            GrantObject::Datasource(name) => {
+                let datasource = catalog
+                    .datasource_names()
+                    .into_iter()
+                    .find(|actual| actual.eq_ignore_ascii_case(name))
+                    .ok_or_else(|| {
+                        RuntimeError::Acl(format!("datasource '{name}' does not exist"))
+                    })?;
+                Ok(ObjectKey::Datasource { datasource })
+            }
+            GrantObject::Schema { datasource, schema } => {
+                for (actual_source, actual_schema) in catalog.schema_names() {
+                    if actual_source.eq_ignore_ascii_case(datasource)
+                        && actual_schema.eq_ignore_ascii_case(schema)
+                    {
+                        return Ok(ObjectKey::Schema {
+                            datasource: actual_source,
+                            schema: actual_schema,
+                        });
+                    }
+                }
+                Err(RuntimeError::Acl(format!(
+                    "schema '{datasource}.{schema}' does not exist"
+                )))
+            }
+            GrantObject::Table {
+                datasource,
+                schema,
+                table,
+            } => {
+                let table = catalog
+                    .resolve_table(Some(datasource), Some(schema), table)
+                    .ok_or_else(|| {
+                        RuntimeError::Acl(format!("table '{}' does not exist", object.path()))
+                    })?;
+                let qualifier = table.qualifier().expect("catalog table has no qualifier");
+                Ok(ObjectKey::Table {
+                    datasource: qualifier.datasource.clone(),
+                    schema: qualifier.schema_name.clone(),
+                    table: table.name.clone(),
+                })
             }
         }
     }
@@ -490,15 +610,22 @@ impl Runtime {
     }
 }
 
-/// Raise unless `grantee` is PUBLIC or an existing user (a typo'd grantee names
-/// no right).
-fn require_grantee_exists(accel: &Accelerator, grantee: &str) -> Result<(), RuntimeError> {
-    if grantee == PUBLIC || accel.get_user(grantee)?.is_some() {
+/// Reject an identity that no longer exists without falling back to a name lookup.
+fn identity_denied() -> RuntimeError {
+    RuntimeError::PermissionDenied("authenticated identity no longer exists".to_string())
+}
+
+/// Require selected-database admission before loading its sources or serving any statement.
+pub(crate) fn require_connect(
+    user: &fq_catalog::store::User,
+    access: Option<DatabasePrivilege>,
+) -> Result<(), RuntimeError> {
+    if user.superuser || access.is_some() {
         return Ok(());
     }
-    Err(RuntimeError::Acl(format!(
-        "GRANT: grantee '{grantee}' is not a user (grant to an existing user or PUBLIC)"
-    )))
+    Err(RuntimeError::PermissionDenied(
+        "database CONNECT required".to_string(),
+    ))
 }
 
 /// Audit one user DDL event: actor + action + target user, never the password.
@@ -569,22 +696,35 @@ fn describe_text(columns: &[&str]) -> Vec<(String, DataType)> {
 }
 
 /// Assemble a SHOW GRANTS result batch from the grant rows.
-fn grants_batch(grants: &[Grant]) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
-    let mut columns: [Vec<String>; 6] = Default::default();
-    for grant in grants {
-        columns[0].push(grant.grantee.clone());
-        columns[1].push(grant.privilege.clone());
-        columns[2].push(grant.object_kind.clone());
-        columns[3].push(grant.object_path.clone());
-        columns[4].push(grant.granted_by.clone());
-        columns[5].push(grant.created_at.clone());
+impl Runtime {
+    /// Assemble authorized local grant rows with current display names.
+    fn grants_batch(
+        &self,
+        grants: &[Grant],
+    ) -> Result<(SchemaRef, Vec<RecordBatch>), RuntimeError> {
+        let mut columns: [Vec<String>; 6] = Default::default();
+        for grant in grants {
+            let name = match grant.subject {
+                GrantSubject::Public => PUBLIC.to_string(),
+                GrantSubject::User(id) => self
+                    .server_catalog()?
+                    .get_user_by_id(id)?
+                    .map_or_else(|| id.to_string(), |user| user.name),
+            };
+            columns[0].push(name);
+            columns[1].push("SELECT".to_string());
+            columns[2].push(grant.object.kind().to_string());
+            columns[3].push(grant.object.label());
+            columns[4].push(grant.granted_by.clone());
+            columns[5].push(grant.created_at.clone());
+        }
+        let schema = grants_schema();
+        let arrays: Vec<Arc<dyn arrow::array::Array>> = columns
+            .into_iter()
+            .map(|values| Arc::new(StringArray::from(values)) as Arc<dyn arrow::array::Array>)
+            .collect();
+        let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)
+            .map_err(|error| RuntimeError::ResultShape(error.to_string()))?;
+        Ok((schema, vec![batch]))
     }
-    let schema = grants_schema();
-    let arrays: Vec<Arc<dyn arrow::array::Array>> = columns
-        .into_iter()
-        .map(|values| Arc::new(StringArray::from(values)) as Arc<dyn arrow::array::Array>)
-        .collect();
-    let batch = RecordBatch::try_new(Arc::clone(&schema), arrays)
-        .map_err(|error| RuntimeError::ResultShape(error.to_string()))?;
-    Ok((schema, vec![batch]))
 }
