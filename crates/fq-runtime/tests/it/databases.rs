@@ -254,3 +254,48 @@ fn recreated_username_cannot_inherit_a_live_session() {
         .execute("CREATE VIEW allowed AS SELECT 1 AS value")
         .expect("new rights");
 }
+
+/// An old-regime stats file next to the config stops a fresh root from opening.
+#[test]
+fn old_stats_file_beside_a_fresh_root_raises() {
+    let (root, config) = config();
+    std::fs::write(root.join("engine.stats.sqlite"), b"old").expect("plant old stats");
+    let error = match Runtime::from_config(&config) {
+        Ok(_) => panic!("old layout must raise"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("engine.stats.sqlite"), "names it: {error}");
+}
+
+/// An old-regime events directory next to the config stops a fresh root.
+#[test]
+fn old_events_dir_beside_a_fresh_root_raises() {
+    let (root, config) = config();
+    std::fs::create_dir(root.join("engine.events")).expect("plant old events");
+    let error = match Runtime::from_config(&config) {
+        Ok(_) => panic!("old layout must raise"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("engine.events"), "names it: {error}");
+}
+
+/// An old-regime materialization file next to the config stops a fresh root.
+#[test]
+fn old_mv_file_beside_a_fresh_root_raises() {
+    let (root, config) = config();
+    std::fs::write(root.join("engine.mv"), b"old").expect("plant old mv");
+    let error = match Runtime::from_config(&config) {
+        Ok(_) => panic!("old layout must raise"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("engine.mv"), "names it: {error}");
+}
+
+/// Once the new root exists, old litter beside the config is not its business.
+#[test]
+fn established_root_ignores_old_litter() {
+    let (root, config) = config();
+    Runtime::from_config(&config).expect("fresh root builds");
+    std::fs::write(root.join("engine.stats.sqlite"), b"old").expect("plant old stats");
+    Runtime::from_config(&config).expect("established root still opens");
+}

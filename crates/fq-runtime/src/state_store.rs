@@ -1,10 +1,11 @@
 //! The guard over the SQLite file the engine keeps its state in.
 //!
-//! One file next to the config (`<config-stem>.stats.sqlite`) holds the learned
-//! statistics, the persisted SET overrides, the dynamic-datasource registry, the
-//! materialized-view catalog and the user/grant store. Every one of those
-//! steers plan choice or access, so a runtime whose state file vanished, was
-//! replaced, or stopped being a database is in an UNKNOWN state.
+//! The server catalog (`<storage-root>/server.sqlite`: users, database registry,
+//! database grants) and the selected database's catalog
+//! (`databases/<database-id>/metadata.sqlite`: datasources, views, settings,
+//! relation namespace, local grants) steer plan choice and access, so a runtime
+//! whose state file vanished, was replaced, or stopped being a database is not
+//! degraded - it is in an UNKNOWN state.
 //!
 //! That is fatal, and it is fatal ONCE: the loss is recorded on the runtime and
 //! every later call returns the same `RuntimeError::StateStoreLost` instead of

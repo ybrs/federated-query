@@ -9,9 +9,9 @@
 #
 # What each process gets of its own: a copy-on-write clone of the DuckDB files and
 # the Parquet directories, a config beside them, and therefore its own engine
-# state (the learned-statistics catalog and materialized-view store live beside
-# the config). Cloning costs about 40ms and almost no disk because it is
-# reflinked. PostgreSQL schemas are READ-ONLY here and stay shared - nothing
+# state (its database storage root lives beside the config). The cloned source
+# files use reflinks where supported. PostgreSQL schemas are READ-ONLY here and
+# stay shared - nothing
 # writes them.
 #
 # THE CONCURRENCY BOUND EXISTS FOR THE PLANNING BUDGET, not for throughput. The

@@ -1,5 +1,14 @@
 # ACL and user system plan - CREATE/ALTER/DROP USER, GRANT/REVOKE, bind-time enforcement
 
+Implemented state: identities, the database registry, and database CONNECT/ADMIN
+grants live in `<storage-root>/server.sqlite` (`fq-catalog::store::ServerCatalog`);
+local SELECT grants live in each database's `databases/<database-id>/metadata.sqlite`
+(`fq-catalog::store::DatabaseCatalog`), keyed by durable relation identity. `fq-accel`
+retains only materialized-result storage. The per-spot notes below naming
+`<config-stem>.stats.sqlite` / `fq-accel/src/catalog.rs` / `ViewCatalog` describe
+the pre-implementation layout and are superseded by that; the enforcement
+semantics (bind-time checks, live generation-gated reads) stand as built.
+
 Identity and access control become manageable at runtime through SQL DDL:
 `CREATE USER <name> WITH PASSWORD '...'`, `ALTER USER`, `DROP USER`, `GRANT
 SELECT ON DATASOURCE|SCHEMA|TABLE ... TO <grantee>`, `REVOKE ...`, `SHOW USERS`,
@@ -8,13 +17,13 @@ Every base-table reference is authorized at BIND time through the single resolve
 (`fq_bind::resolve_scan_table`), so an unauthorized reference raises a bind error
 and never returns a row. Passwords are NEVER stored: the store holds a
 PostgreSQL-`pg_authid`-shaped SCRAM VERIFIER (salt, iteration count, StoredKey,
-ServerKey). Users and grants persist in the same stats SQLite that already holds
-`dynamic_datasources` and `materialized_views`, opened by the accelerator's
-durable (`synchronous=ON`) connection.
+ServerKey). Users, the database registry, and database CONNECT/ADMIN grants persist
+in `<storage-root>/server.sqlite`; local SELECT grants persist in each database's
+`databases/<database-id>/metadata.sqlite`, keyed by durable identity.
 
 This follows the dynamic-catalog family - a lexical DDL classifier
-(`fq-parse/src/statement.rs`), persisted registry rows in
-`<config-stem>.stats.sqlite` (`fq-accel/src/catalog.rs`), a `Runtime` handler
+(`fq-parse/src/statement.rs`), persisted registry rows in `server.sqlite` and each
+database's `metadata.sqlite` (`fq-catalog::store`), a `Runtime` handler
 module (mirroring `dynamic_catalog.rs`) - with ONE deliberate divergence: grant
 visibility is NOT a frozen per-session snapshot, because privilege staleness
 EXTENDS access (section 8).
@@ -46,15 +55,14 @@ EXTENDS access (section 8).
   that resolves result columns without executing. `dynamic_catalog.rs` is the
   template ACL DDL copies; ACL handlers go in a new `acl.rs` module declared
   beside `mod dynamic_catalog;`.
-- PERSISTED REGISTRY. `fq-accel/src/catalog.rs`'s `ViewCatalog` owns a
-  `Mutex<rusqlite::Connection>` over `<config-stem>.stats.sqlite` with
-  `PRAGMA journal_mode=WAL` and `synchronous` left ON (durable operator state,
-  unlike the learned stats which run `synchronous=OFF`). It carries the
-  `INSERT OR IGNORE` + rows-affected first-writer-wins pattern
-  (`insert_datasource`), the open-time `pragma_table_info` column migration
-  (`add_datasource_optional_columns`), and the busy-retry open (`with_busy_retry`,
-  `BUSY_TIMEOUT=5s`). Users and grants become two more tables in this file, added
-  to `ensure_schema` (`catalog.rs:411`). A `Clock` closure
+- PERSISTED REGISTRY. `fq-catalog::store` owns two SQLite registries: `ServerCatalog`
+  over `<storage-root>/server.sqlite` (users, database registry, CONNECT/ADMIN
+grants) and one `DatabaseCatalog` per database over
+  `databases/<database-id>/metadata.sqlite` (datasources, views, settings, the
+  shared relation namespace, local SELECT grants). Both open with
+  `PRAGMA journal_mode=WAL`, bounded busy retries, and transactional schema
+  setup. Identity is a stable UUID; grants key by it, so a dropped and recreated
+  name never inherits old rights. A `Clock` closure
   (`Arc<dyn Fn() -> String>`, RFC3339) stamps `created_at` at insert time.
 - THE ONE RESOLVER. `fq_bind::Binder::resolve_scan_table`
   (`fq-bind/src/binder.rs:114`) is the SOLE function that turns a table reference
@@ -373,11 +381,10 @@ dispatch-level check.
 
 ## 7. Persistence schema
 
-Two tables in the accelerator's `ViewCatalog` connection (durable,
-`synchronous=ON`), created in `ensure_schema` (`catalog.rs:411`) and migrated by
-the `pragma_table_info` pattern (`add_*_optional_columns`). NOT in the
-`StatsCatalog` connection, which runs `synchronous=OFF` (correctness-neutral
-learned stats); authz is durable state.
+Users and the database registry in the `ServerCatalog` connection
+(`server.sqlite`); local grants in the selected database's `DatabaseCatalog`
+connection (`metadata.sqlite`). Authz is durable state, transactional with the
+same-connection generation bump the live-session cache relies on (section 8).
 
 ```sql
 users (
@@ -448,8 +455,9 @@ therefore NOT acceptable.
 DECIDED: grant and user state is read LIVE, not from a frozen snapshot, gated by a
 cheap per-query generation check.
 
-- The `grants`/`users` tables live in the shared `<config-stem>.stats.sqlite`
-  (WAL, many readers + one writer). Each connection's `Runtime` has its own
+- The `users` table lives in the shared `server.sqlite` and each database's local
+  `grants` live in its own `metadata.sqlite` (WAL, many readers + one writer).
+  Each connection's `Runtime` has its own
   connection over the SAME file, so a `GRANT`/`REVOKE`/`ALTER USER`/`DROP USER`
   committed by any connection is immediately visible to every other connection's
   reads (WAL read-committed). There is no cross-process propagation to build - the
@@ -571,8 +579,9 @@ cheap per-query generation check.
 
 ## 11. Concurrency
 
-- CONCURRENT USER/GRANT DDL. Writes go through `ViewCatalog`'s
-  `Mutex<Connection>` within a process and SQLite's single-writer WAL across
+- CONCURRENT USER/GRANT DDL. Writes go through the owning catalog's
+  connection (`ServerCatalog` for users and database grants, `DatabaseCatalog`
+  for local grants) within a process and SQLite's single-writer WAL across
   connections, with the busy-retry already in place. `CREATE USER` /
   `GRANT` use `INSERT OR IGNORE` + rows-affected (first-writer-wins for users;
   idempotent for grants). Each DDL write and its `acl_meta.generation` increment
@@ -593,9 +602,9 @@ cheap per-query generation check.
 DECIDED: for embedded `fedq-py` / the CLI, the default identity is SUPERUSER and
 ACL enforcement is effectively off; enforcement lives primarily in `fedq-server`.
 
-Rationale, stated plainly: an embedded process OWNS the config file and the stats
-SQLite on the local filesystem. It can read every verifier, rewrite the `grants`
-table, or point at a different store - so enforcing ACLs against the process that
+Rationale, stated plainly: an embedded process OWNS the config file and the storage
+root on the local filesystem. It can read every verifier, rewrite the grant
+tables, or point at a different store - so enforcing ACLs against the process that
 owns the files provides NO real security boundary; the actual boundary is OS file
 permissions on the config and the SQLite. Pretending otherwise would be security
 theater. The embedded principal is therefore an implicit superuser: it can still

@@ -8,11 +8,13 @@ rendering, and the readline loop.
 ## Options
 
 ```
-fedq --config <YAML> [--command <SQL> | --file <PATH>] [--format table|csv|json] [--timings]
+fedq --config <YAML> [--database <NAME>] [--command <SQL> | --file <PATH>] [--format table|csv|json] [--timings]
 ```
 
 - `--config, -c <YAML>` (required): the YAML engine config (datasources,
   optimizer, cost, ...), the same format the server and tests use.
+- `--database <NAME>` (default `main`): the database namespace every
+  statement in this process runs in. `main` is bootstrapped automatically.
 - `--command <SQL>`: run one statement, then exit (one-shot mode). Mutually
   exclusive with `--file`.
 - `--file <PATH>`: run the file's contents as one statement, then exit.

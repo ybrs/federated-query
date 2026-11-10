@@ -3,13 +3,64 @@
 use crate::{DatabaseLease, DatabaseManager, Runtime, RuntimeError};
 use fq_catalog::store::{DatabaseCatalog, ServerCatalog, StoreError};
 use fq_common::Config;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// Old-regime state siblings the engine never adopts or deletes.
+const OLD_LAYOUT_SUFFIXES: [&str; 3] = [".stats.sqlite", ".events", ".mv"];
 
 /// Open the configured physical storage root when persistence is configured.
 pub(crate) fn open_manager(config: &Config) -> Result<Option<DatabaseManager>, RuntimeError> {
     let root = config.storage.resolve(config.source_path.as_deref())?;
-    root.map(|root| DatabaseManager::open(&root)).transpose()
+    let Some(root) = root else {
+        return Ok(None);
+    };
+    reject_abandoned_layout(config, &root)?;
+    Ok(Some(DatabaseManager::open(&root)?))
+}
+
+/// List old-regime artifacts sitting next to the config file.
+fn old_layout_artifacts(config_path: &str) -> Result<Vec<PathBuf>, RuntimeError> {
+    let path = Path::new(config_path);
+    let directory = path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = path
+        .file_stem()
+        .unwrap_or_else(|| std::ffi::OsStr::new("fedq"))
+        .to_string_lossy();
+    let mut found = Vec::new();
+    for suffix in OLD_LAYOUT_SUFFIXES {
+        let candidate = directory.join(format!("{stem}{suffix}"));
+        if candidate.try_exists()? {
+            found.push(candidate);
+        }
+    }
+    Ok(found)
+}
+
+/// Refuse a fresh storage root while old-regime state sits next to the config:
+/// adopting it would mix layouts and deleting it would lose data.
+fn reject_abandoned_layout(config: &Config, root: &Path) -> Result<(), RuntimeError> {
+    let Some(config_path) = config.source_path.as_deref() else {
+        return Ok(());
+    };
+    if root.join("server.sqlite").try_exists()? {
+        return Ok(());
+    }
+    let found = old_layout_artifacts(config_path)?;
+    if found.is_empty() {
+        return Ok(());
+    }
+    let mut names = Vec::new();
+    for path in &found {
+        names.push(path.display().to_string());
+    }
+    Err(RuntimeError::Config(format!(
+        "old engine state ({}) sits next to the config while the storage root '{}' \
+         was never created; move or delete the old state, the engine never adopts \
+         or removes it",
+        names.join(", "),
+        root.display()
+    )))
 }
 
 /// Open identities without loading project sources or materialized results.

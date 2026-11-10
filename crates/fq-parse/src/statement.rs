@@ -2005,6 +2005,8 @@ mod tests {
         );
         assert!(classify_statement("DROP USER IF EXISTS alice").is_err());
         assert!(classify_statement("DROP USER alice CASCADE").is_err());
+        assert!(classify_statement("DROP USER \"alice").is_err());
+        assert!(classify_statement("DROP USER alice extra").is_err());
     }
 
     #[test]

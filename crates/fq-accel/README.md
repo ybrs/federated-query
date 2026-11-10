@@ -21,8 +21,11 @@ orders(o_orderkey, o_custkey, o_region, o_total)   -- 12 rows
 region_dim(rd_name, rd_manager)                    -- US/Alice, EU/Bob, ASIA/Carol
 ```
 
-The config is one file; the view store hangs off its stem (`<stem>.mv/` for
-chunks, `<stem>.stats.sqlite` for the registry). The DDL is `CREATE / REFRESH /
+The config is one file; engine state hangs off the derived storage root
+(`<stem>.data/`, or an explicit `storage.root`): each database owns
+`databases/<database-id>/{metadata.sqlite,materialized/,scratch/}`,
+and the view registry is the shared relation namespace in that database's
+`metadata.sqlite` (chunks stay under its `materialized/`). The DDL is `CREATE / REFRESH /
 DROP MATERIALIZED VIEW` with an optional `change_keys` entry.
 
 --------------------------------------------------------------------------------

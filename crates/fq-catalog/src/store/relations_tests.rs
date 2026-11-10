@@ -24,7 +24,7 @@ fn relation_names_cannot_change_kind_through_replace() {
     let catalog = catalog();
     let target = view(&catalog, "build");
     assert!(catalog
-        .reserve_relation("build", RelationKind::View, "root")
+        .reserve_relation("build", RelationKind::MaterializedView, "root")
         .is_err());
     let reservation = catalog
         .reserve_relation("pending", RelationKind::View, "root")

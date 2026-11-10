@@ -397,21 +397,16 @@ def adbc_driver_path():
 
 
 def engine_state_paths():
-    """Return every path the engine derives from the config to store its state.
+    """Return the generated harness config's existing database storage root.
 
-    The engine keeps its learned-statistics catalog and materialized-view chunks
-    beside the config it was launched from (``<stem>.stats.sqlite`` and
-    ``<stem>.mv/``); the location is not configurable. These are engine state,
-    not test data: a run that inherits statistics learned by an earlier run plans
-    differently from one that does not, so the suite clears them and every run
-    starts from the same state.
+    The root owns every database catalog, learned statistic, setting, and
+    materialized result. Clearing it prevents a previous run from changing
+    plans or grants. Datasource files live outside this root.
     """
-    stem = os.path.splitext(CONFIG_PATH)[0]
-    paths = []
-    for candidate in (stem + ".stats.sqlite", stem + ".mv"):
-        if os.path.exists(candidate):
-            paths.append(candidate)
-    return paths
+    storage_root = os.path.splitext(CONFIG_PATH)[0] + ".data"
+    if os.path.exists(storage_root):
+        return [storage_root]
+    return []
 
 
 def expected_row_counts(specs):

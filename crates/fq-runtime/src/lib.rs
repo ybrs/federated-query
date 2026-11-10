@@ -1607,3 +1607,49 @@ fn renamed_schema(schema: &SchemaRef, names: &[String]) -> SchemaRef {
     }
     Arc::new(Schema::new(fields))
 }
+
+#[cfg(test)]
+mod session_guard_tests {
+    use super::*;
+
+    /// Register a source specification under the guarded session.
+    fn register_probe(session: connectors::SessionId) {
+        let spec = connectors::spec_from_kind(
+            "duckdb",
+            Some("/nonexistent/probe.duckdb".to_string()),
+            None,
+        )
+        .expect("probe spec");
+        connectors::register(session, "probe".to_string(), spec);
+    }
+
+    /// Whether the probe registration is visible under `session`.
+    fn probe_visible(session: connectors::SessionId) -> bool {
+        let _scope = connectors::SessionScope::enter(session);
+        connectors::kind("probe").is_ok()
+    }
+
+    /// Dropping an undefused guard prunes everything registered under it.
+    #[test]
+    fn session_guard_drop_prunes_registrations() {
+        let guard = SessionGuard(Some(connectors::open_session()));
+        register_probe(guard.id());
+        assert!(probe_visible(guard.id()));
+        let session = guard.id();
+        drop(guard);
+        assert!(!probe_visible(session), "guard drop must prune the session");
+    }
+
+    /// A defused guard hands its session over without pruning it.
+    #[test]
+    fn session_guard_defuse_keeps_registrations() {
+        let guard = SessionGuard(Some(connectors::open_session()));
+        register_probe(guard.id());
+        let session = guard.defuse();
+        assert!(
+            probe_visible(session),
+            "defused session must stay registered"
+        );
+        connectors::prune_session(session);
+    }
+}

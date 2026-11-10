@@ -58,11 +58,11 @@ impl Sandbox {
         path_str
     }
 
-    /// A config with the seeded DuckDB source and `server.users` set to one
-    /// bootstrap superuser, so wire principals enforce their grants.
-    fn config(&self) -> Config {
+    /// A config over an already-seeded DuckDB path (lets a test add schemas
+    /// after seeding but before the runtime loads its catalog).
+    fn config_for_seed(&self, seed: &str) -> Config {
         let mut datasources = BTreeMap::new();
-        datasources.insert("duck".to_string(), duck_bootstrap(&self.seed_duck()));
+        datasources.insert("duck".to_string(), duck_bootstrap(seed));
         Config {
             storage: fq_common::StorageConfig::default(),
             datasources,
@@ -80,7 +80,12 @@ impl Sandbox {
     /// A runtime over the sandbox config (an embedded implicit superuser until a
     /// principal is set).
     fn runtime(&self) -> Runtime {
-        let runtime = Runtime::from_config(&self.config()).expect("from_config");
+        self.runtime_for_seed(&self.seed_duck())
+    }
+
+    /// A runtime over an already-seeded DuckDB path, with public CONNECT.
+    fn runtime_for_seed(&self, seed: &str) -> Runtime {
+        let runtime = Runtime::from_config(&self.config_for_seed(seed)).expect("from_config");
         run(&runtime, "GRANT CONNECT ON DATABASE main TO PUBLIC");
         runtime
     }
@@ -382,4 +387,33 @@ fn bootstrap_refuses_to_start_without_a_superuser() {
         .unwrap_err()
         .to_string();
     assert!(error.contains("superuser"), "refuse-start message: {error}");
+}
+
+#[test]
+fn a_schema_grant_resolves_an_empty_schema() {
+    let sandbox = Sandbox::new("empty_schema");
+    let seed = sandbox.seed_duck();
+    let source = DuckDbSource::open("seed", &seed).expect("open seed duckdb");
+    source
+        .execute_batch("CREATE SCHEMA void")
+        .expect("create empty schema");
+    drop(source);
+    let runtime = sandbox.runtime_for_seed(&seed);
+    run(&runtime, "CREATE USER bob WITH PASSWORD 'pw'");
+    // The schema holds no tables; the grant still resolves (a table-list
+    // lookup would wrongly report the schema as missing).
+    run(&runtime, "GRANT SELECT ON SCHEMA duck.void TO bob");
+    runtime.set_principal("bob").expect("set principal");
+    assert!(!can_see(&runtime, "SELECT id FROM duck.main.orders"));
+}
+
+#[test]
+fn an_unknown_principal_leaves_enforcement_on() {
+    let sandbox = Sandbox::new("unknown_principal");
+    let runtime = sandbox.runtime();
+    let error = runtime.set_principal("ghost").unwrap_err().to_string();
+    assert!(error.contains("identity"), "unknown-user error: {error}");
+    // The failed bind enabled enforcement first: nothing serves unenforced.
+    assert!(runtime.describe("SELECT id FROM duck.main.orders").is_err());
+    assert!(runtime.execute("SELECT id FROM duck.main.orders").is_err());
 }

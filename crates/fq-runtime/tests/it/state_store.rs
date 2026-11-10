@@ -1,5 +1,5 @@
-//! The engine state store as a fatal dependency: a runtime whose
-//! `<config-stem>.stats.sqlite` is truncated, deleted or replaced underneath it
+//! The engine state store as a fatal dependency: a runtime whose selected
+//! database catalog is truncated, deleted or replaced underneath it
 //! raises ONCE, naming the file, and then refuses every later call with that
 //! same error instead of serving work it has no state for.
 
@@ -74,7 +74,7 @@ fn config_for(dir: &Path, file: &Path) -> Config {
     }
 }
 
-/// The state store path a config derives: `<config-stem>.stats.sqlite`.
+/// The state store path a config derives: the selected database's catalog.
 fn store_path(dir: &Path) -> PathBuf {
     super::storage::main_paths(&dir.join("config.data")).metadata
 }

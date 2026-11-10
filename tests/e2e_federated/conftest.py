@@ -43,16 +43,11 @@ def _connect_pg():
 
 @pytest.fixture(scope="session", autouse=True)
 def fresh_engine_state():
-    """Clear the engine's learned state so every run starts from the same place.
+    """Remove the generated config's database storage before runtimes open.
 
-    The engine writes its learned-statistics catalog and materialized-view chunks
-    beside the config it was launched from, and the configs are pre-built at a
-    stable location, so without this a run would plan using statistics learned by
-    the previous one. That makes a result depend on how many times the suite has
-    been run before, which is not a result. Testing the learning loop is a second
-    pass over a warmed harness, not the default.
-
-    This removes engine state only. The datasources and configs are untouched.
+    Removing the storage root clears catalogs, learned statistics, settings,
+    and materialized results so previous runs cannot change plans or grants.
+    Datasource files and the configuration live outside the removed root.
     """
     removed = 0
     for path in harness.engine_state_paths():

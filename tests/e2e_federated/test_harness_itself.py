@@ -16,6 +16,7 @@ import os
 
 import pytest
 
+from tests.e2e_federated import conftest as fixture_mod
 from tests.e2e_federated import harness
 from tests.e2e_federated import placements as placement_mod
 from tests.e2e_federated import runtime as runtime_mod
@@ -176,3 +177,20 @@ def test_expected_row_counts_come_from_the_specs():
     """Row counts the verifier compares against are computed, never written down."""
     counts = harness.expected_row_counts(list(_specs(["orders"]).values()))
     assert counts["orders"] > 0
+
+
+def test_fresh_engine_state_clears_database_catalogs(tmp_path, monkeypatch):
+    """Clear nested database state while preserving configs and datasource files."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("datasources: {}\n", encoding="ascii")
+    source_path = tmp_path / "source.duckdb"
+    source_path.write_bytes(b"source data")
+    storage_root = tmp_path / "config.data"
+    metadata = storage_root / "databases" / "database-id" / "metadata.sqlite"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_bytes(b"catalog state")
+    monkeypatch.setattr(harness, "CONFIG_PATH", str(config_path))
+    assert fixture_mod.fresh_engine_state.__wrapped__() == 1
+    assert not storage_root.exists()
+    assert config_path.read_text(encoding="ascii") == "datasources: {}\n"
+    assert source_path.read_bytes() == b"source data"
