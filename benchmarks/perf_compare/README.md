@@ -4,6 +4,55 @@ Reproducible cold + warm comparison of the OLD (Python) and NEW (Rust) engines
 per source. No ad-hoc timing runs: if a perf number is not produced by this
 harness, it does not go in a report, a commit message, or a decision.
 
+## Game-studio accelerator over the real server
+
+The same runner also measures the complete materialized-view lifecycle over
+the PostgreSQL wire protocol and the game-studio Docker Compose sources:
+
+```bash
+"$VIRTUAL_ENV/bin/python3" benchmarks/perf_compare/compare.py \
+  studio-accelerator --label my-studio-accelerator-run
+```
+
+Run from the repository root after generating/loading
+`tutorials/game-studio` and starting its Compose databases. The runner builds
+the release workspace, starts its own FedQ servers, and copies the source
+config into a private report catalog. Set `GAME_STUDIO_DOCKER='sudo -n docker'`
+on hosts where Docker requires it. Labels are unique and never overwritten.
+
+Every invocation runs all seven phases: live join, full CREATE, substituted
+read, source inserts with a stale read, live bypass, whole REFRESH, and a
+refreshed substituted read. Default work is 175 FedQ client statements:
+56 timed targets, 14 untimed warmups, and 105 setup/inspection/cleanup calls,
+plus two real MySQL mutation statements. Allow a few minutes for this
+22-server-start lifecycle with an up-to-date release build. Required release
+compilation happens first and is outside the per-statement measurements.
+
+Cold samples each use a fresh Python worker, release-server process, and
+runtime; warm medians use one live server connection across the experiment.
+Defaults are `--cold-runs 3 --runs 5 --warmups 2`. Cold and warm are always
+measured. Learned-statistics reads are disabled to prevent persisted estimates
+leaking between cold samples; the default planning budget is unchanged.
+SQL tracing and fragment recording stay enabled throughout. Timings cover
+statement issue through full result decoding, including planning, execution,
+and wire transport. CREATE includes its complete build; REFRESH includes its
+complete refresh. The DROP preparing each CREATE is outside that CREATE.
+
+Both data states have independent DuckDB oracle answers, computed once before
+measurement and checked against every sampled result. Cache claims require
+`MaterializedScan` plus a sole materialized fragment. The runner checks chunk
+content hashes, whole-refresh statuses, and successful restoration of the
+original live result. Existing reserved ticket IDs raise before mutation.
+SQL errors/budget kills are ERROR/KILLED; other failures raise and keep an
+incomplete report. Source rows and the experiment's view are cleaned up.
+
+`results/<label>/results.json` retains every raw sample and diagnostic;
+`REPORT.md` shows cold and warm medians. Full server/worker logs and copied
+Arrow chunks accompany them. CREATE/REFRESH do not replace the SELECT fragment
+journal, so their actual fetch SQL is in `live.server.log`. Engine, harness,
+SQL, and fixture hashes identify the measured implementation and inputs.
+These helpers are orchestrated by `compare.py`; there is no second runner.
+
 ## Definitions (fixed - do not reinterpret per run)
 
 - COLD: a fresh OS process AND a fresh runtime per single measurement. A cached

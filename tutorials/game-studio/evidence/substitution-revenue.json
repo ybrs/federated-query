@@ -1,0 +1,192 @@
+{
+  "query": "SELECT review.subscription_plan,\n       review.supported_players,\n       review.gameplay_tickets,\n       review.handling_minutes,\n       revenue.revenue_cents\nFROM (\n    SELECT p.subscription_plan,\n           COUNT(DISTINCT p.player_id) AS supported_players,\n           COUNT(*) AS gameplay_tickets,\n           SUM(t.handling_minutes) AS handling_minutes\n    FROM billing.public.players AS p\n    JOIN crm.support.tickets AS t ON p.player_id = t.player_id\n    JOIN (\n        SELECT e.player_id\n        FROM gameplay.gameplay.events AS e\n        WHERE e.event_name = 'session_start'\n        GROUP BY e.player_id\n    ) AS active ON p.player_id = active.player_id\n    WHERE t.category = 'gameplay'\n    GROUP BY p.subscription_plan\n) AS review\nJOIN (\n    SELECT customer.subscription_plan,\n           SUM(payment.amount_cents) AS revenue_cents\n    FROM billing.public.players AS customer\n    JOIN billing.public.transactions AS payment\n        ON customer.player_id = payment.player_id\n    WHERE payment.status = 'settled'\n    GROUP BY customer.subscription_plan\n) AS revenue ON review.subscription_plan = revenue.subscription_plan\nORDER BY review.handling_minutes DESC\nLIMIT 2",
+  "definition": "SELECT p.subscription_plan,\n       COUNT(DISTINCT p.player_id) AS supported_players,\n       COUNT(*) AS gameplay_tickets,\n       SUM(t.handling_minutes) AS handling_minutes\nFROM billing.public.players AS p\nJOIN crm.support.tickets AS t ON p.player_id = t.player_id\nJOIN (\n    SELECT e.player_id\n    FROM gameplay.gameplay.events AS e\n    WHERE e.event_name = 'session_start'\n    GROUP BY e.player_id\n) AS active ON p.player_id = active.player_id\nWHERE t.category = 'gameplay'\nGROUP BY p.subscription_plan",
+  "view": "studio_accelerator_support",
+  "oracle": [
+    {
+      "subscription_plan": "free",
+      "supported_players": 140,
+      "gameplay_tickets": 239,
+      "handling_minutes": 5839,
+      "revenue_cents": 145793
+    },
+    {
+      "subscription_plan": "monthly",
+      "supported_players": 53,
+      "gameplay_tickets": 90,
+      "handling_minutes": 2259,
+      "revenue_cents": 122466
+    }
+  ],
+  "live_plan": [
+    {
+      "plan": "Limit"
+    },
+    {
+      "plan": "  Sort"
+    },
+    {
+      "plan": "    Projection"
+    },
+    {
+      "plan": "      HashJoin [INNER] keys=(\"review\".\"subscription_plan\" = \"revenue\".\"subscription_plan\") build=Right rows=?"
+    },
+    {
+      "plan": "        AliasedRelation"
+    },
+    {
+      "plan": "          HashAggregate group=[\"p\".\"subscription_plan\"]"
+    },
+    {
+      "plan": "            HashJoin [INNER] keys=(\"p\".\"player_id\" = \"active\".\"player_id\") build=Right rows=9892 stats=defaulted[ndv(t.player_id), eq_selectivity(gameplay.gameplay.events.event_name), group_ndv(gameplay.gameplay.events.player_id), ndv(active.player_id)]"
+    },
+    {
+      "plan": "              HashJoin [INNER] keys=(\"p\".\"player_id\" = \"t\".\"player_id\") build=Left rows=363 stats=defaulted[ndv(t.player_id)]"
+    },
+    {
+      "plan": "                Scan [billing] cost=10.48ms rows=300 stats=defaulted[avg_width] :: SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\""
+    },
+    {
+      "plan": "                Scan [crm] filter=(\"t\".\"player_id\" IN (...)) cost=10.87ms rows=363 stats=defaulted[avg_width] :: SELECT `player_id`, `category`, `handling_minutes` FROM `support`.`tickets` AS `t` WHERE (`t`.`category` = 'gameplay')"
+    },
+    {
+      "plan": "              AliasedRelation"
+    },
+    {
+      "plan": "                Scan [gameplay] +inject(player_id) cost=23.08ms rows=8176 stats=defaulted[avg_width] :: SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\""
+    },
+    {
+      "plan": "        AliasedRelation"
+    },
+    {
+      "plan": "          RemoteQuery [billing] +inject(subscription_plan) cost=?(rtt 10.0ms) rows=? :: SELECT \"customer\".\"subscription_plan\" AS \"subscription_plan\", SUM(\"payment\".\"amount_cents\") AS \"revenue_cents\" FROM \"public\".\"players\" AS \"customer\" INNER JOIN \"public\".\"transactions\" AS \"payment\" ON (\"customer\".\"player_id\" = \"payment\".\"player_id\") WHERE (\"payment\".\"status\" = 'settled') GROUP BY \"customer\".\"subscription_plan\""
+    }
+  ],
+  "live_rows": [
+    {
+      "subscription_plan": "free",
+      "supported_players": 140,
+      "gameplay_tickets": 239,
+      "handling_minutes": 5839,
+      "revenue_cents": "145793"
+    },
+    {
+      "subscription_plan": "monthly",
+      "supported_players": 53,
+      "gameplay_tickets": 90,
+      "handling_minutes": 2259,
+      "revenue_cents": "122466"
+    }
+  ],
+  "live_fragments": [
+    {
+      "datasource": "billing",
+      "source_sql": "SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\"",
+      "canonical_sql": "SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\"",
+      "output_names": "player_id, subscription_plan",
+      "has_dynamic_filter": false
+    },
+    {
+      "datasource": "crm",
+      "source_sql": "SELECT `player_id`, `category`, `handling_minutes` FROM `support`.`tickets` AS `t` WHERE (`t`.`category` = 'gameplay')",
+      "canonical_sql": "SELECT \"player_id\", \"category\", \"handling_minutes\" FROM \"support\".\"tickets\" AS \"t\" WHERE (\"t\".\"category\" = 'gameplay')",
+      "output_names": "player_id, category, handling_minutes",
+      "has_dynamic_filter": true
+    },
+    {
+      "datasource": "gameplay",
+      "source_sql": "SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\"",
+      "canonical_sql": "SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\"",
+      "output_names": "player_id",
+      "has_dynamic_filter": false
+    },
+    {
+      "datasource": "billing",
+      "source_sql": "SELECT \"customer\".\"subscription_plan\" AS \"subscription_plan\", SUM(\"payment\".\"amount_cents\") AS \"revenue_cents\" FROM \"public\".\"players\" AS \"customer\" INNER JOIN \"public\".\"transactions\" AS \"payment\" ON (\"customer\".\"player_id\" = \"payment\".\"player_id\") WHERE (\"payment\".\"status\" = 'settled') GROUP BY \"customer\".\"subscription_plan\"",
+      "canonical_sql": "SELECT \"customer\".\"subscription_plan\" AS \"subscription_plan\", SUM(\"payment\".\"amount_cents\") AS \"revenue_cents\" FROM \"public\".\"players\" AS \"customer\" INNER JOIN \"public\".\"transactions\" AS \"payment\" ON (\"customer\".\"player_id\" = \"payment\".\"player_id\") WHERE (\"payment\".\"status\" = 'settled') GROUP BY \"customer\".\"subscription_plan\"",
+      "output_names": "subscription_plan, revenue_cents",
+      "has_dynamic_filter": false
+    }
+  ],
+  "before": [
+    {
+      "name": "studio_accelerator_support",
+      "rows": 3,
+      "bytes": 2650,
+      "created": "2026-11-11T23:37:38.954935340+00:00",
+      "refreshed": null,
+      "use_count": 0,
+      "cost_saved": 0.0
+    }
+  ],
+  "cached_plan": [
+    {
+      "plan": "Limit"
+    },
+    {
+      "plan": "  Sort"
+    },
+    {
+      "plan": "    Projection"
+    },
+    {
+      "plan": "      HashJoin [INNER] keys=(\"review\".\"subscription_plan\" = \"revenue\".\"subscription_plan\") build=Right rows=?"
+    },
+    {
+      "plan": "        AliasedRelation"
+    },
+    {
+      "plan": "          MaterializedScan [studio_accelerator_support] cost=10.01ms rows=3 stats=defaulted[avg_width] :: SELECT \"subscription_plan\", \"supported_players\", \"gameplay_tickets\", \"handling_minutes\" FROM \"public\".\"studio_accelerator_support\""
+    },
+    {
+      "plan": "        AliasedRelation"
+    },
+    {
+      "plan": "          RemoteQuery [billing] +inject(subscription_plan) cost=?(rtt 10.0ms) rows=? :: SELECT \"customer\".\"subscription_plan\" AS \"subscription_plan\", SUM(\"payment\".\"amount_cents\") AS \"revenue_cents\" FROM \"public\".\"players\" AS \"customer\" INNER JOIN \"public\".\"transactions\" AS \"payment\" ON (\"customer\".\"player_id\" = \"payment\".\"player_id\") WHERE (\"payment\".\"status\" = 'settled') GROUP BY \"customer\".\"subscription_plan\""
+    }
+  ],
+  "cached_rows": [
+    {
+      "subscription_plan": "free",
+      "supported_players": 140,
+      "gameplay_tickets": 239,
+      "handling_minutes": 5839,
+      "revenue_cents": "145793"
+    },
+    {
+      "subscription_plan": "monthly",
+      "supported_players": 53,
+      "gameplay_tickets": 90,
+      "handling_minutes": 2259,
+      "revenue_cents": "122466"
+    }
+  ],
+  "cached_fragments": [
+    {
+      "datasource": "accel:/data/projects/fedq-public/tutorials/game-studio/generated/fedq-state/databases/e9c20089-4352-481f-bae2-0676277884d3/materialized",
+      "source_sql": "SELECT \"subscription_plan\", \"supported_players\", \"gameplay_tickets\", \"handling_minutes\" FROM \"public\".\"studio_accelerator_support\"",
+      "canonical_sql": "SELECT \"subscription_plan\", \"supported_players\", \"gameplay_tickets\", \"handling_minutes\" FROM \"public\".\"studio_accelerator_support\"",
+      "output_names": "subscription_plan, supported_players, gameplay_tickets, handling_minutes",
+      "has_dynamic_filter": false
+    },
+    {
+      "datasource": "billing",
+      "source_sql": "SELECT \"customer\".\"subscription_plan\" AS \"subscription_plan\", SUM(\"payment\".\"amount_cents\") AS \"revenue_cents\" FROM \"public\".\"players\" AS \"customer\" INNER JOIN \"public\".\"transactions\" AS \"payment\" ON (\"customer\".\"player_id\" = \"payment\".\"player_id\") WHERE (\"payment\".\"status\" = 'settled') GROUP BY \"customer\".\"subscription_plan\"",
+      "canonical_sql": "SELECT \"customer\".\"subscription_plan\" AS \"subscription_plan\", SUM(\"payment\".\"amount_cents\") AS \"revenue_cents\" FROM \"public\".\"players\" AS \"customer\" INNER JOIN \"public\".\"transactions\" AS \"payment\" ON (\"customer\".\"player_id\" = \"payment\".\"player_id\") WHERE (\"payment\".\"status\" = 'settled') GROUP BY \"customer\".\"subscription_plan\"",
+      "output_names": "subscription_plan, revenue_cents",
+      "has_dynamic_filter": false
+    }
+  ],
+  "after": [
+    {
+      "name": "studio_accelerator_support",
+      "rows": 3,
+      "bytes": 2650,
+      "created": "2026-11-11T23:37:38.954935340+00:00",
+      "refreshed": null,
+      "use_count": 1,
+      "cost_saved": 8914.0
+    }
+  ],
+  "view_removed": true
+}

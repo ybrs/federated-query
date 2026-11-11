@@ -1,0 +1,2062 @@
+{
+  "runs": [
+    {
+      "source_report": "benchmarks/perf_compare/results/game-studio-accelerator-run3/results.json",
+      "source_report_sha256": "be2b9b8d46e62fca52eb4a11234a28286df8c797cde31e4e2b45fec352cc0549",
+      "meta": {
+        "created_utc": "2026-11-11T22:19:58.513941+00:00",
+        "git_commit": "dfce108815dc74211702ef472197864793702713",
+        "git_dirty": true,
+        "sha256": {
+          "benchmarks/perf_compare/studio_accelerator.py": "40b745712784882b92e751fe120384ec913595dc5f857347917f99c0f7f50e48",
+          "benchmarks/perf_compare/studio_inputs.py": "9a17a280e743ac91e71ab1c5037f0b43a04f20e9eac764bf535d634924af8aba",
+          "benchmarks/perf_compare/studio_measure.py": "9841afc6d53dc4daf8ec42360c3041faec1d46181642ff16d444974b7ffc9087",
+          "benchmarks/perf_compare/studio_report.py": "3286d6929b1b3dc1851546dcb10ca7163bd997433726e1831be9a4e8a1820188",
+          "benchmarks/perf_compare/compare.py": "43e5e97ff50f3997e6dd8d6422adece692fbc8af1e232e7d9c1a4819d998c6c3",
+          "benchmarks/perf_compare/wire_runtime.py": "168e0ffef4aefc6ba958812e7f272cbc67aff58f5634ee1c49efa2e5a7be44a2",
+          "target/release/fedq-server": "ab4cf0d37708651582b4b17991bac75488cbdea249f6a4f32bcd84d7e48cef6a",
+          "tutorials/game-studio/generated/players.parquet": "54124b1c7d51b388c0d7baf22342be04846bd3bb53ce5d76abd181d937241da7",
+          "tutorials/game-studio/generated/tickets.parquet": "1fcab7e752c698ba90c210eb2711bbdb32c712b13bc1ee67c269289d91bd6859",
+          "tutorials/game-studio/generated/events.parquet": "17125f53bd9d98dfab166f7364aa3bcde7516673ca0ef84da363bf38c1ea61ca",
+          "tutorials/game-studio/queries/06_accelerator_support.sql": "74e1b977df5d696e45fb6294d9571ced5a5d64798771b508725f636521cbfffa",
+          "tutorials/game-studio/accelerator-insert.sql": "2b36c38b9ac772509b238d8161b1f14297c94580ece29bd7af69b2f38693925c",
+          "tutorials/game-studio/accelerator-undo.sql": "dc6bdffa252edbbf05c56ce1263f5a197ebfc09237f2e1a0ca1c2f9518317c7b",
+          "tutorials/game-studio/compose.yaml": "3bec2ad33e16087c90fb473b9346a70b5416079764ad777d08196d683291b641"
+        },
+        "platform": "Linux-6.8.0-100-generic-x86_64-with-glibc2.39",
+        "args": {
+          "label": "game-studio-accelerator-run3",
+          "config": "/data/projects/fedq-public/tutorials/game-studio/generated/fedq.yaml",
+          "cold_runs": 3,
+          "runs": 5,
+          "warmups": 2
+        },
+        "query_transport": "PostgreSQL wire",
+        "cold": "fresh Python worker + release server + runtime per sample",
+        "warm": "one live server connection across all phases",
+        "learned_statistics": false,
+        "planning_budget": "engine default",
+        "sql_trace_enabled": true,
+        "fragment_recording": true
+      },
+      "query": "SELECT p.subscription_plan,\n       COUNT(DISTINCT p.player_id) AS supported_players,\n       COUNT(*) AS gameplay_tickets,\n       SUM(t.handling_minutes) AS handling_minutes\nFROM billing.public.players AS p\nJOIN crm.support.tickets AS t ON p.player_id = t.player_id\nJOIN (\n    SELECT e.player_id\n    FROM gameplay.gameplay.events AS e\n    WHERE e.event_name = 'session_start'\n    GROUP BY e.player_id\n) AS active ON p.player_id = active.player_id\nWHERE t.category = 'gameplay'\nGROUP BY p.subscription_plan\n",
+      "oracle": {
+        "before": [
+          {
+            "subscription_plan": "annual",
+            "supported_players": 22,
+            "gameplay_tickets": 34,
+            "handling_minutes": 786
+          },
+          {
+            "subscription_plan": "free",
+            "supported_players": 140,
+            "gameplay_tickets": 239,
+            "handling_minutes": 5839
+          },
+          {
+            "subscription_plan": "monthly",
+            "supported_players": 53,
+            "gameplay_tickets": 90,
+            "handling_minutes": 2259
+          }
+        ],
+        "after": [
+          {
+            "subscription_plan": "annual",
+            "supported_players": 22,
+            "gameplay_tickets": 34,
+            "handling_minutes": 786
+          },
+          {
+            "subscription_plan": "free",
+            "supported_players": 140,
+            "gameplay_tickets": 241,
+            "handling_minutes": 5879
+          },
+          {
+            "subscription_plan": "monthly",
+            "supported_players": 53,
+            "gameplay_tickets": 90,
+            "handling_minutes": 2259
+          }
+        ]
+      },
+      "summary": {
+        "live": {
+          "cold_ms": 149.1101961582899,
+          "warm_ms": 14.642570167779922,
+          "cold_samples_ms": [
+            106.87606409192085,
+            170.86833342909813,
+            149.1101961582899
+          ],
+          "warm_samples_ms": [
+            15.399239957332611,
+            13.798404484987259,
+            14.558417722582817,
+            14.699878171086311,
+            14.642570167779922
+          ]
+        },
+        "build": {
+          "cold_ms": 307.53946118056774,
+          "warm_ms": 201.0334301739931,
+          "cold_samples_ms": [
+            286.18469275534153,
+            307.53946118056774,
+            375.8124615997076
+          ],
+          "warm_samples_ms": [
+            168.13292913138866,
+            201.0334301739931,
+            250.98149292171001,
+            202.86070927977562,
+            201.03153586387634
+          ]
+        },
+        "cached": {
+          "cold_ms": 67.29777157306671,
+          "warm_ms": 66.62287004292011,
+          "cold_samples_ms": [
+            67.16133654117584,
+            67.29777157306671,
+            83.52943882346153
+          ],
+          "warm_samples_ms": [
+            58.23727138340473,
+            58.1378024071455,
+            66.62964262068272,
+            66.6844230145216,
+            66.62287004292011
+          ]
+        },
+        "stale": {
+          "cold_ms": 83.2249354571104,
+          "warm_ms": 58.26203338801861,
+          "cold_samples_ms": [
+            82.91075378656387,
+            91.71124547719955,
+            83.2249354571104
+          ],
+          "warm_samples_ms": [
+            58.171484619379044,
+            66.71700067818165,
+            58.267468586564064,
+            58.26203338801861,
+            57.83417448401451
+          ]
+        },
+        "bypass": {
+          "cold_ms": 91.54854714870453,
+          "warm_ms": 16.15653745830059,
+          "cold_samples_ms": [
+            158.63180719316006,
+            88.89958448708057,
+            91.54854714870453
+          ],
+          "warm_samples_ms": [
+            15.610668808221817,
+            16.3580272346735,
+            15.702540054917336,
+            16.731463372707367,
+            16.15653745830059
+          ]
+        },
+        "refresh": {
+          "cold_ms": 236.24194785952568,
+          "warm_ms": 75.17969608306885,
+          "cold_samples_ms": [
+            209.6529435366392,
+            244.34422701597214,
+            236.24194785952568
+          ],
+          "warm_samples_ms": [
+            66.495256498456,
+            83.26485566794872,
+            75.17969608306885,
+            75.06633549928665,
+            76.75917074084282
+          ]
+        },
+        "refreshed": {
+          "cold_ms": 83.56203138828278,
+          "warm_ms": 66.59924425184727,
+          "cold_samples_ms": [
+            83.57357606291771,
+            83.56203138828278,
+            83.47991667687893
+          ],
+          "warm_samples_ms": [
+            66.59924425184727,
+            66.44956395030022,
+            66.74887053668499,
+            66.40074215829372,
+            66.68483838438988
+          ]
+        }
+      },
+      "inspections": {
+        "live": {
+          "plan": [
+            {
+              "plan": "HashAggregate group=[\"p\".\"subscription_plan\"]"
+            },
+            {
+              "plan": "  HashJoin [INNER] keys=(\"p\".\"player_id\" = \"active\".\"player_id\") build=Right rows=12018 stats=defaulted[ndv(t.player_id), eq_selectivity(gameplay.gameplay.events.event_name), group_ndv(gameplay.gameplay.events.player_id), ndv(active.player_id)]"
+            },
+            {
+              "plan": "    HashJoin [INNER] keys=(\"p\".\"player_id\" = \"t\".\"player_id\") build=Left rows=441 stats=defaulted[ndv(t.player_id)]"
+            },
+            {
+              "plan": "      Scan [billing] cost=10.48ms rows=300 stats=defaulted[avg_width] :: SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\""
+            },
+            {
+              "plan": "      Scan [crm] filter=(\"t\".\"player_id\" IN (...)) cost=11.06ms rows=441 stats=defaulted[avg_width] :: SELECT `player_id`, `category`, `handling_minutes` FROM `support`.`tickets` AS `t` WHERE (`t`.`category` = 'gameplay')"
+            },
+            {
+              "plan": "    AliasedRelation"
+            },
+            {
+              "plan": "      Scan [gameplay] +inject(player_id) cost=23.08ms rows=8176 stats=defaulted[avg_width] :: SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\""
+            }
+          ],
+          "rows": [
+            {
+              "subscription_plan": "free",
+              "supported_players": 140,
+              "gameplay_tickets": 239,
+              "handling_minutes": 5839
+            },
+            {
+              "subscription_plan": "annual",
+              "supported_players": 22,
+              "gameplay_tickets": 34,
+              "handling_minutes": 786
+            },
+            {
+              "subscription_plan": "monthly",
+              "supported_players": 53,
+              "gameplay_tickets": 90,
+              "handling_minutes": 2259
+            }
+          ],
+          "fragments": [
+            {
+              "datasource": "billing",
+              "source_sql": "SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\"",
+              "canonical_sql": "SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\"",
+              "output_names": "player_id, subscription_plan",
+              "has_dynamic_filter": false
+            },
+            {
+              "datasource": "crm",
+              "source_sql": "SELECT `player_id`, `category`, `handling_minutes` FROM `support`.`tickets` AS `t` WHERE (`t`.`category` = 'gameplay')",
+              "canonical_sql": "SELECT \"player_id\", \"category\", \"handling_minutes\" FROM \"support\".\"tickets\" AS \"t\" WHERE (\"t\".\"category\" = 'gameplay')",
+              "output_names": "player_id, category, handling_minutes",
+              "has_dynamic_filter": true
+            },
+            {
+              "datasource": "gameplay",
+              "source_sql": "SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\"",
+              "canonical_sql": "SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\"",
+              "output_names": "player_id",
+              "has_dynamic_filter": false
+            }
+          ],
+          "views": []
+        },
+        "cached": {
+          "plan": [
+            {
+              "plan": "MaterializedScan [studio_accelerator_support] cost=10.01ms rows=3 stats=defaulted[avg_width] :: SELECT \"subscription_plan\", \"supported_players\", \"gameplay_tickets\", \"handling_minutes\" FROM \"public\".\"studio_accelerator_support\""
+            }
+          ],
+          "rows": [
+            {
+              "subscription_plan": "annual",
+              "supported_players": 22,
+              "gameplay_tickets": 34,
+              "handling_minutes": 786
+            },
+            {
+              "subscription_plan": "monthly",
+              "supported_players": 53,
+              "gameplay_tickets": 90,
+              "handling_minutes": 2259
+            },
+            {
+              "subscription_plan": "free",
+              "supported_players": 140,
+              "gameplay_tickets": 239,
+              "handling_minutes": 5839
+            }
+          ],
+          "fragments": [
+            {
+              "datasource": "accel:/data/projects/fedq-public/benchmarks/perf_compare/results/game-studio-accelerator-run3/state/databases/52e71764-541f-47bb-b74e-6696d728c4d3/materialized",
+              "source_sql": "SELECT \"subscription_plan\", \"supported_players\", \"gameplay_tickets\", \"handling_minutes\" FROM \"public\".\"studio_accelerator_support\"",
+              "canonical_sql": "SELECT \"subscription_plan\", \"supported_players\", \"gameplay_tickets\", \"handling_minutes\" FROM \"public\".\"studio_accelerator_support\"",
+              "output_names": "subscription_plan, supported_players, gameplay_tickets, handling_minutes",
+              "has_dynamic_filter": false
+            }
+          ],
+          "views": [
+            {
+              "name": "studio_accelerator_support",
+              "rows": 3,
+              "bytes": 2650,
+              "created": "2026-11-11T22:20:07.519537839+00:00",
+              "refreshed": null,
+              "use_count": 11,
+              "cost_saved": 98054.0
+            }
+          ]
+        },
+        "stale": {
+          "plan": [
+            {
+              "plan": "MaterializedScan [studio_accelerator_support] cost=10.01ms rows=3 stats=defaulted[avg_width] :: SELECT \"subscription_plan\", \"supported_players\", \"gameplay_tickets\", \"handling_minutes\" FROM \"public\".\"studio_accelerator_support\""
+            }
+          ],
+          "rows": [
+            {
+              "subscription_plan": "annual",
+              "supported_players": 22,
+              "gameplay_tickets": 34,
+              "handling_minutes": 786
+            },
+            {
+              "subscription_plan": "monthly",
+              "supported_players": 53,
+              "gameplay_tickets": 90,
+              "handling_minutes": 2259
+            },
+            {
+              "subscription_plan": "free",
+              "supported_players": 140,
+              "gameplay_tickets": 239,
+              "handling_minutes": 5839
+            }
+          ],
+          "fragments": [
+            {
+              "datasource": "accel:/data/projects/fedq-public/benchmarks/perf_compare/results/game-studio-accelerator-run3/state/databases/52e71764-541f-47bb-b74e-6696d728c4d3/materialized",
+              "source_sql": "SELECT \"subscription_plan\", \"supported_players\", \"gameplay_tickets\", \"handling_minutes\" FROM \"public\".\"studio_accelerator_support\"",
+              "canonical_sql": "SELECT \"subscription_plan\", \"supported_players\", \"gameplay_tickets\", \"handling_minutes\" FROM \"public\".\"studio_accelerator_support\"",
+              "output_names": "subscription_plan, supported_players, gameplay_tickets, handling_minutes",
+              "has_dynamic_filter": false
+            }
+          ],
+          "views": [
+            {
+              "name": "studio_accelerator_support",
+              "rows": 3,
+              "bytes": 2650,
+              "created": "2026-11-11T22:20:07.519537839+00:00",
+              "refreshed": null,
+              "use_count": 22,
+              "cost_saved": 196108.0
+            }
+          ]
+        },
+        "bypass": {
+          "plan": [
+            {
+              "plan": "HashAggregate group=[\"p\".\"subscription_plan\"]"
+            },
+            {
+              "plan": "  HashJoin [INNER] keys=(\"p\".\"player_id\" = \"active\".\"player_id\") build=Right rows=12018 stats=defaulted[ndv(t.player_id), eq_selectivity(gameplay.gameplay.events.event_name), group_ndv(gameplay.gameplay.events.player_id), ndv(active.player_id)]"
+            },
+            {
+              "plan": "    HashJoin [INNER] keys=(\"p\".\"player_id\" = \"t\".\"player_id\") build=Left rows=441 stats=defaulted[ndv(t.player_id)]"
+            },
+            {
+              "plan": "      Scan [billing] cost=10.48ms rows=300 stats=defaulted[avg_width] :: SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\""
+            },
+            {
+              "plan": "      Scan [crm] filter=(\"t\".\"player_id\" IN (...)) cost=11.06ms rows=441 stats=defaulted[avg_width] :: SELECT `player_id`, `category`, `handling_minutes` FROM `support`.`tickets` AS `t` WHERE (`t`.`category` = 'gameplay')"
+            },
+            {
+              "plan": "    AliasedRelation"
+            },
+            {
+              "plan": "      Scan [gameplay] +inject(player_id) cost=23.08ms rows=8176 stats=defaulted[avg_width] :: SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\""
+            }
+          ],
+          "rows": [
+            {
+              "subscription_plan": "free",
+              "supported_players": 140,
+              "gameplay_tickets": 241,
+              "handling_minutes": 5879
+            },
+            {
+              "subscription_plan": "annual",
+              "supported_players": 22,
+              "gameplay_tickets": 34,
+              "handling_minutes": 786
+            },
+            {
+              "subscription_plan": "monthly",
+              "supported_players": 53,
+              "gameplay_tickets": 90,
+              "handling_minutes": 2259
+            }
+          ],
+          "fragments": [
+            {
+              "datasource": "billing",
+              "source_sql": "SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\"",
+              "canonical_sql": "SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\"",
+              "output_names": "player_id, subscription_plan",
+              "has_dynamic_filter": false
+            },
+            {
+              "datasource": "crm",
+              "source_sql": "SELECT `player_id`, `category`, `handling_minutes` FROM `support`.`tickets` AS `t` WHERE (`t`.`category` = 'gameplay')",
+              "canonical_sql": "SELECT \"player_id\", \"category\", \"handling_minutes\" FROM \"support\".\"tickets\" AS \"t\" WHERE (\"t\".\"category\" = 'gameplay')",
+              "output_names": "player_id, category, handling_minutes",
+              "has_dynamic_filter": true
+            },
+            {
+              "datasource": "gameplay",
+              "source_sql": "SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\"",
+              "canonical_sql": "SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\"",
+              "output_names": "player_id",
+              "has_dynamic_filter": false
+            }
+          ],
+          "views": [
+            {
+              "name": "studio_accelerator_support",
+              "rows": 3,
+              "bytes": 2650,
+              "created": "2026-11-11T22:20:07.519537839+00:00",
+              "refreshed": null,
+              "use_count": 22,
+              "cost_saved": 196108.0
+            }
+          ]
+        },
+        "refreshed": {
+          "plan": [
+            {
+              "plan": "MaterializedScan [studio_accelerator_support] cost=10.01ms rows=3 stats=defaulted[avg_width] :: SELECT \"subscription_plan\", \"supported_players\", \"gameplay_tickets\", \"handling_minutes\" FROM \"public\".\"studio_accelerator_support\""
+            }
+          ],
+          "rows": [
+            {
+              "subscription_plan": "free",
+              "supported_players": 140,
+              "gameplay_tickets": 241,
+              "handling_minutes": 5879
+            },
+            {
+              "subscription_plan": "annual",
+              "supported_players": 22,
+              "gameplay_tickets": 34,
+              "handling_minutes": 786
+            },
+            {
+              "subscription_plan": "monthly",
+              "supported_players": 53,
+              "gameplay_tickets": 90,
+              "handling_minutes": 2259
+            }
+          ],
+          "fragments": [
+            {
+              "datasource": "accel:/data/projects/fedq-public/benchmarks/perf_compare/results/game-studio-accelerator-run3/state/databases/52e71764-541f-47bb-b74e-6696d728c4d3/materialized",
+              "source_sql": "SELECT \"subscription_plan\", \"supported_players\", \"gameplay_tickets\", \"handling_minutes\" FROM \"public\".\"studio_accelerator_support\"",
+              "canonical_sql": "SELECT \"subscription_plan\", \"supported_players\", \"gameplay_tickets\", \"handling_minutes\" FROM \"public\".\"studio_accelerator_support\"",
+              "output_names": "subscription_plan, supported_players, gameplay_tickets, handling_minutes",
+              "has_dynamic_filter": false
+            }
+          ],
+          "views": [
+            {
+              "name": "studio_accelerator_support",
+              "rows": 3,
+              "bytes": 2650,
+              "created": "2026-11-11T22:20:07.519537839+00:00",
+              "refreshed": "2026-11-11T22:20:16.607385876+00:00",
+              "use_count": 33,
+              "cost_saved": 294162.0
+            }
+          ]
+        }
+      },
+      "chunks": {
+        "cached": [
+          {
+            "file": "state/databases/52e71764-541f-47bb-b74e-6696d728c4d3/materialized/studio_accelerator_support-f7b113e5e3d975f3/chunk-0-0.arrow",
+            "bytes": 2650,
+            "sha256": "3369b9be63bcf1696e2bf0a407a7cdfc25c9e67415233a5a920078776143f681"
+          }
+        ],
+        "stale": [
+          {
+            "file": "state/databases/52e71764-541f-47bb-b74e-6696d728c4d3/materialized/studio_accelerator_support-f7b113e5e3d975f3/chunk-0-0.arrow",
+            "bytes": 2650,
+            "sha256": "3369b9be63bcf1696e2bf0a407a7cdfc25c9e67415233a5a920078776143f681"
+          }
+        ],
+        "refreshed": [
+          {
+            "file": "state/databases/52e71764-541f-47bb-b74e-6696d728c4d3/materialized/studio_accelerator_support-f7b113e5e3d975f3/chunk-10-0.arrow",
+            "bytes": 2650,
+            "sha256": "603fc158b772448fc525fd1f48f22a8d18b9142951d44bef2aaa3c88cb7ff331"
+          }
+        ]
+      },
+      "refresh": {
+        "previous_select_fragments_after_refresh_ddl": [
+          {
+            "datasource": "billing",
+            "source_sql": "SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\"",
+            "canonical_sql": "SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\"",
+            "output_names": "player_id, subscription_plan",
+            "has_dynamic_filter": false
+          },
+          {
+            "datasource": "crm",
+            "source_sql": "SELECT `player_id`, `category`, `handling_minutes` FROM `support`.`tickets` AS `t` WHERE (`t`.`category` = 'gameplay')",
+            "canonical_sql": "SELECT \"player_id\", \"category\", \"handling_minutes\" FROM \"support\".\"tickets\" AS \"t\" WHERE (\"t\".\"category\" = 'gameplay')",
+            "output_names": "player_id, category, handling_minutes",
+            "has_dynamic_filter": true
+          },
+          {
+            "datasource": "gameplay",
+            "source_sql": "SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\"",
+            "canonical_sql": "SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\"",
+            "output_names": "player_id",
+            "has_dynamic_filter": false
+          }
+        ],
+        "views": [
+          {
+            "name": "studio_accelerator_support",
+            "rows": 3,
+            "bytes": 2650,
+            "created": "2026-11-11T22:20:07.519537839+00:00",
+            "refreshed": "2026-11-11T22:20:16.607385876+00:00",
+            "use_count": 22,
+            "cost_saved": 196108.0
+          }
+        ],
+        "note": "CREATE/REFRESH do not replace the SELECT fragment journal; inspect the actual SQL trace in live.server.log."
+      },
+      "executed_statements": 175,
+      "completed": true,
+      "restored": true,
+      "samples": [
+        {
+          "phase": "live",
+          "mode": "cold",
+          "index": 0,
+          "status": "OK",
+          "ms": 106.87606409192085
+        },
+        {
+          "phase": "live",
+          "mode": "cold",
+          "index": 1,
+          "status": "OK",
+          "ms": 170.86833342909813
+        },
+        {
+          "phase": "live",
+          "mode": "cold",
+          "index": 2,
+          "status": "OK",
+          "ms": 149.1101961582899
+        },
+        {
+          "phase": "live",
+          "mode": "warmup",
+          "index": 0,
+          "status": "OK"
+        },
+        {
+          "phase": "live",
+          "mode": "warmup",
+          "index": 1,
+          "status": "OK"
+        },
+        {
+          "phase": "live",
+          "mode": "warm",
+          "index": 2,
+          "status": "OK",
+          "ms": 15.399239957332611
+        },
+        {
+          "phase": "live",
+          "mode": "warm",
+          "index": 3,
+          "status": "OK",
+          "ms": 13.798404484987259
+        },
+        {
+          "phase": "live",
+          "mode": "warm",
+          "index": 4,
+          "status": "OK",
+          "ms": 14.558417722582817
+        },
+        {
+          "phase": "live",
+          "mode": "warm",
+          "index": 5,
+          "status": "OK",
+          "ms": 14.699878171086311
+        },
+        {
+          "phase": "live",
+          "mode": "warm",
+          "index": 6,
+          "status": "OK",
+          "ms": 14.642570167779922
+        },
+        {
+          "phase": "build",
+          "mode": "cold",
+          "index": 0,
+          "status": "OK",
+          "ms": 286.18469275534153
+        },
+        {
+          "phase": "build",
+          "mode": "cold",
+          "index": 1,
+          "status": "OK",
+          "ms": 307.53946118056774
+        },
+        {
+          "phase": "build",
+          "mode": "cold",
+          "index": 2,
+          "status": "OK",
+          "ms": 375.8124615997076
+        },
+        {
+          "phase": "build",
+          "mode": "warmup",
+          "index": 0,
+          "status": "OK"
+        },
+        {
+          "phase": "build",
+          "mode": "warmup",
+          "index": 1,
+          "status": "OK"
+        },
+        {
+          "phase": "build",
+          "mode": "warm",
+          "index": 2,
+          "status": "OK",
+          "ms": 168.13292913138866
+        },
+        {
+          "phase": "build",
+          "mode": "warm",
+          "index": 3,
+          "status": "OK",
+          "ms": 201.0334301739931
+        },
+        {
+          "phase": "build",
+          "mode": "warm",
+          "index": 4,
+          "status": "OK",
+          "ms": 250.98149292171001
+        },
+        {
+          "phase": "build",
+          "mode": "warm",
+          "index": 5,
+          "status": "OK",
+          "ms": 202.86070927977562
+        },
+        {
+          "phase": "build",
+          "mode": "warm",
+          "index": 6,
+          "status": "OK",
+          "ms": 201.03153586387634
+        },
+        {
+          "phase": "cached",
+          "mode": "cold",
+          "index": 0,
+          "status": "OK",
+          "ms": 67.16133654117584
+        },
+        {
+          "phase": "cached",
+          "mode": "cold",
+          "index": 1,
+          "status": "OK",
+          "ms": 67.29777157306671
+        },
+        {
+          "phase": "cached",
+          "mode": "cold",
+          "index": 2,
+          "status": "OK",
+          "ms": 83.52943882346153
+        },
+        {
+          "phase": "cached",
+          "mode": "warmup",
+          "index": 0,
+          "status": "OK"
+        },
+        {
+          "phase": "cached",
+          "mode": "warmup",
+          "index": 1,
+          "status": "OK"
+        },
+        {
+          "phase": "cached",
+          "mode": "warm",
+          "index": 2,
+          "status": "OK",
+          "ms": 58.23727138340473
+        },
+        {
+          "phase": "cached",
+          "mode": "warm",
+          "index": 3,
+          "status": "OK",
+          "ms": 58.1378024071455
+        },
+        {
+          "phase": "cached",
+          "mode": "warm",
+          "index": 4,
+          "status": "OK",
+          "ms": 66.62964262068272
+        },
+        {
+          "phase": "cached",
+          "mode": "warm",
+          "index": 5,
+          "status": "OK",
+          "ms": 66.6844230145216
+        },
+        {
+          "phase": "cached",
+          "mode": "warm",
+          "index": 6,
+          "status": "OK",
+          "ms": 66.62287004292011
+        },
+        {
+          "phase": "stale",
+          "mode": "cold",
+          "index": 0,
+          "status": "OK",
+          "ms": 82.91075378656387
+        },
+        {
+          "phase": "stale",
+          "mode": "cold",
+          "index": 1,
+          "status": "OK",
+          "ms": 91.71124547719955
+        },
+        {
+          "phase": "stale",
+          "mode": "cold",
+          "index": 2,
+          "status": "OK",
+          "ms": 83.2249354571104
+        },
+        {
+          "phase": "stale",
+          "mode": "warmup",
+          "index": 0,
+          "status": "OK"
+        },
+        {
+          "phase": "stale",
+          "mode": "warmup",
+          "index": 1,
+          "status": "OK"
+        },
+        {
+          "phase": "stale",
+          "mode": "warm",
+          "index": 2,
+          "status": "OK",
+          "ms": 58.171484619379044
+        },
+        {
+          "phase": "stale",
+          "mode": "warm",
+          "index": 3,
+          "status": "OK",
+          "ms": 66.71700067818165
+        },
+        {
+          "phase": "stale",
+          "mode": "warm",
+          "index": 4,
+          "status": "OK",
+          "ms": 58.267468586564064
+        },
+        {
+          "phase": "stale",
+          "mode": "warm",
+          "index": 5,
+          "status": "OK",
+          "ms": 58.26203338801861
+        },
+        {
+          "phase": "stale",
+          "mode": "warm",
+          "index": 6,
+          "status": "OK",
+          "ms": 57.83417448401451
+        },
+        {
+          "phase": "bypass",
+          "mode": "cold",
+          "index": 0,
+          "status": "OK",
+          "ms": 158.63180719316006
+        },
+        {
+          "phase": "bypass",
+          "mode": "cold",
+          "index": 1,
+          "status": "OK",
+          "ms": 88.89958448708057
+        },
+        {
+          "phase": "bypass",
+          "mode": "cold",
+          "index": 2,
+          "status": "OK",
+          "ms": 91.54854714870453
+        },
+        {
+          "phase": "bypass",
+          "mode": "warmup",
+          "index": 0,
+          "status": "OK"
+        },
+        {
+          "phase": "bypass",
+          "mode": "warmup",
+          "index": 1,
+          "status": "OK"
+        },
+        {
+          "phase": "bypass",
+          "mode": "warm",
+          "index": 2,
+          "status": "OK",
+          "ms": 15.610668808221817
+        },
+        {
+          "phase": "bypass",
+          "mode": "warm",
+          "index": 3,
+          "status": "OK",
+          "ms": 16.3580272346735
+        },
+        {
+          "phase": "bypass",
+          "mode": "warm",
+          "index": 4,
+          "status": "OK",
+          "ms": 15.702540054917336
+        },
+        {
+          "phase": "bypass",
+          "mode": "warm",
+          "index": 5,
+          "status": "OK",
+          "ms": 16.731463372707367
+        },
+        {
+          "phase": "bypass",
+          "mode": "warm",
+          "index": 6,
+          "status": "OK",
+          "ms": 16.15653745830059
+        },
+        {
+          "phase": "refresh",
+          "mode": "cold",
+          "index": 0,
+          "status": "OK",
+          "ms": 209.6529435366392
+        },
+        {
+          "phase": "refresh",
+          "mode": "cold",
+          "index": 1,
+          "status": "OK",
+          "ms": 244.34422701597214
+        },
+        {
+          "phase": "refresh",
+          "mode": "cold",
+          "index": 2,
+          "status": "OK",
+          "ms": 236.24194785952568
+        },
+        {
+          "phase": "refresh",
+          "mode": "warmup",
+          "index": 0,
+          "status": "OK"
+        },
+        {
+          "phase": "refresh",
+          "mode": "warmup",
+          "index": 1,
+          "status": "OK"
+        },
+        {
+          "phase": "refresh",
+          "mode": "warm",
+          "index": 2,
+          "status": "OK",
+          "ms": 66.495256498456
+        },
+        {
+          "phase": "refresh",
+          "mode": "warm",
+          "index": 3,
+          "status": "OK",
+          "ms": 83.26485566794872
+        },
+        {
+          "phase": "refresh",
+          "mode": "warm",
+          "index": 4,
+          "status": "OK",
+          "ms": 75.17969608306885
+        },
+        {
+          "phase": "refresh",
+          "mode": "warm",
+          "index": 5,
+          "status": "OK",
+          "ms": 75.06633549928665
+        },
+        {
+          "phase": "refresh",
+          "mode": "warm",
+          "index": 6,
+          "status": "OK",
+          "ms": 76.75917074084282
+        },
+        {
+          "phase": "refreshed",
+          "mode": "cold",
+          "index": 0,
+          "status": "OK",
+          "ms": 83.57357606291771
+        },
+        {
+          "phase": "refreshed",
+          "mode": "cold",
+          "index": 1,
+          "status": "OK",
+          "ms": 83.56203138828278
+        },
+        {
+          "phase": "refreshed",
+          "mode": "cold",
+          "index": 2,
+          "status": "OK",
+          "ms": 83.47991667687893
+        },
+        {
+          "phase": "refreshed",
+          "mode": "warmup",
+          "index": 0,
+          "status": "OK"
+        },
+        {
+          "phase": "refreshed",
+          "mode": "warmup",
+          "index": 1,
+          "status": "OK"
+        },
+        {
+          "phase": "refreshed",
+          "mode": "warm",
+          "index": 2,
+          "status": "OK",
+          "ms": 66.59924425184727
+        },
+        {
+          "phase": "refreshed",
+          "mode": "warm",
+          "index": 3,
+          "status": "OK",
+          "ms": 66.44956395030022
+        },
+        {
+          "phase": "refreshed",
+          "mode": "warm",
+          "index": 4,
+          "status": "OK",
+          "ms": 66.74887053668499
+        },
+        {
+          "phase": "refreshed",
+          "mode": "warm",
+          "index": 5,
+          "status": "OK",
+          "ms": 66.40074215829372
+        },
+        {
+          "phase": "refreshed",
+          "mode": "warm",
+          "index": 6,
+          "status": "OK",
+          "ms": 66.68483838438988
+        }
+      ]
+    },
+    {
+      "source_report": "benchmarks/perf_compare/results/game-studio-accelerator-run4/results.json",
+      "source_report_sha256": "a4b9a0bb6fd66230b23344c5cf3ec026200b8dba0605a6706c3d4b75c06648fe",
+      "meta": {
+        "created_utc": "2026-11-11T22:20:19.895663+00:00",
+        "git_commit": "dfce108815dc74211702ef472197864793702713",
+        "git_dirty": true,
+        "sha256": {
+          "benchmarks/perf_compare/studio_accelerator.py": "40b745712784882b92e751fe120384ec913595dc5f857347917f99c0f7f50e48",
+          "benchmarks/perf_compare/studio_inputs.py": "9a17a280e743ac91e71ab1c5037f0b43a04f20e9eac764bf535d634924af8aba",
+          "benchmarks/perf_compare/studio_measure.py": "9841afc6d53dc4daf8ec42360c3041faec1d46181642ff16d444974b7ffc9087",
+          "benchmarks/perf_compare/studio_report.py": "3286d6929b1b3dc1851546dcb10ca7163bd997433726e1831be9a4e8a1820188",
+          "benchmarks/perf_compare/compare.py": "43e5e97ff50f3997e6dd8d6422adece692fbc8af1e232e7d9c1a4819d998c6c3",
+          "benchmarks/perf_compare/wire_runtime.py": "168e0ffef4aefc6ba958812e7f272cbc67aff58f5634ee1c49efa2e5a7be44a2",
+          "target/release/fedq-server": "ab4cf0d37708651582b4b17991bac75488cbdea249f6a4f32bcd84d7e48cef6a",
+          "tutorials/game-studio/generated/players.parquet": "54124b1c7d51b388c0d7baf22342be04846bd3bb53ce5d76abd181d937241da7",
+          "tutorials/game-studio/generated/tickets.parquet": "1fcab7e752c698ba90c210eb2711bbdb32c712b13bc1ee67c269289d91bd6859",
+          "tutorials/game-studio/generated/events.parquet": "17125f53bd9d98dfab166f7364aa3bcde7516673ca0ef84da363bf38c1ea61ca",
+          "tutorials/game-studio/queries/06_accelerator_support.sql": "74e1b977df5d696e45fb6294d9571ced5a5d64798771b508725f636521cbfffa",
+          "tutorials/game-studio/accelerator-insert.sql": "2b36c38b9ac772509b238d8161b1f14297c94580ece29bd7af69b2f38693925c",
+          "tutorials/game-studio/accelerator-undo.sql": "dc6bdffa252edbbf05c56ce1263f5a197ebfc09237f2e1a0ca1c2f9518317c7b",
+          "tutorials/game-studio/compose.yaml": "3bec2ad33e16087c90fb473b9346a70b5416079764ad777d08196d683291b641"
+        },
+        "platform": "Linux-6.8.0-100-generic-x86_64-with-glibc2.39",
+        "args": {
+          "label": "game-studio-accelerator-run4",
+          "config": "/data/projects/fedq-public/tutorials/game-studio/generated/fedq.yaml",
+          "cold_runs": 3,
+          "runs": 5,
+          "warmups": 2
+        },
+        "query_transport": "PostgreSQL wire",
+        "cold": "fresh Python worker + release server + runtime per sample",
+        "warm": "one live server connection across all phases",
+        "learned_statistics": false,
+        "planning_budget": "engine default",
+        "sql_trace_enabled": true,
+        "fragment_recording": true
+      },
+      "query": "SELECT p.subscription_plan,\n       COUNT(DISTINCT p.player_id) AS supported_players,\n       COUNT(*) AS gameplay_tickets,\n       SUM(t.handling_minutes) AS handling_minutes\nFROM billing.public.players AS p\nJOIN crm.support.tickets AS t ON p.player_id = t.player_id\nJOIN (\n    SELECT e.player_id\n    FROM gameplay.gameplay.events AS e\n    WHERE e.event_name = 'session_start'\n    GROUP BY e.player_id\n) AS active ON p.player_id = active.player_id\nWHERE t.category = 'gameplay'\nGROUP BY p.subscription_plan\n",
+      "oracle": {
+        "before": [
+          {
+            "subscription_plan": "annual",
+            "supported_players": 22,
+            "gameplay_tickets": 34,
+            "handling_minutes": 786
+          },
+          {
+            "subscription_plan": "free",
+            "supported_players": 140,
+            "gameplay_tickets": 239,
+            "handling_minutes": 5839
+          },
+          {
+            "subscription_plan": "monthly",
+            "supported_players": 53,
+            "gameplay_tickets": 90,
+            "handling_minutes": 2259
+          }
+        ],
+        "after": [
+          {
+            "subscription_plan": "annual",
+            "supported_players": 22,
+            "gameplay_tickets": 34,
+            "handling_minutes": 786
+          },
+          {
+            "subscription_plan": "free",
+            "supported_players": 140,
+            "gameplay_tickets": 241,
+            "handling_minutes": 5879
+          },
+          {
+            "subscription_plan": "monthly",
+            "supported_players": 53,
+            "gameplay_tickets": 90,
+            "handling_minutes": 2259
+          }
+        ]
+      },
+      "summary": {
+        "live": {
+          "cold_ms": 112.99842037260532,
+          "warm_ms": 14.066901057958603,
+          "cold_samples_ms": [
+            96.44683636724949,
+            185.08590012788773,
+            112.99842037260532
+          ],
+          "warm_samples_ms": [
+            15.072895213961601,
+            14.066901057958603,
+            13.402886688709259,
+            14.274036511778831,
+            13.865955173969269
+          ]
+        },
+        "build": {
+          "cold_ms": 300.80416426062584,
+          "warm_ms": 226.0645404458046,
+          "cold_samples_ms": [
+            352.2945027798414,
+            241.20144546031952,
+            300.80416426062584
+          ],
+          "warm_samples_ms": [
+            226.0645404458046,
+            209.07155983150005,
+            251.10176764428616,
+            184.41746570169926,
+            332.63038098812103
+          ]
+        },
+        "cached": {
+          "cold_ms": 83.54624547064304,
+          "warm_ms": 58.25633183121681,
+          "cold_samples_ms": [
+            83.60995166003704,
+            83.54624547064304,
+            75.33111423254013
+          ],
+          "warm_samples_ms": [
+            50.089770928025246,
+            58.33398550748825,
+            58.13111923635006,
+            58.39816480875015,
+            58.25633183121681
+          ]
+        },
+        "stale": {
+          "cold_ms": 75.13314858078957,
+          "warm_ms": 58.30814689397812,
+          "cold_samples_ms": [
+            66.75547361373901,
+            83.52478966116905,
+            75.13314858078957
+          ],
+          "warm_samples_ms": [
+            58.367760851979256,
+            58.235082775354385,
+            58.15143883228302,
+            58.32540802657604,
+            58.30814689397812
+          ]
+        },
+        "bypass": {
+          "cold_ms": 157.51680731773376,
+          "warm_ms": 16.11252687871456,
+          "cold_samples_ms": [
+            91.14564768970013,
+            157.51680731773376,
+            162.66696900129318
+          ],
+          "warm_samples_ms": [
+            16.11252687871456,
+            15.603918582201004,
+            15.624778345227242,
+            16.214514151215553,
+            16.834910959005356
+          ]
+        },
+        "refresh": {
+          "cold_ms": 209.54295061528683,
+          "warm_ms": 149.96553026139736,
+          "cold_samples_ms": [
+            209.54295061528683,
+            201.2075763195753,
+            211.1557051539421
+          ],
+          "warm_samples_ms": [
+            77.35218107700348,
+            157.7081959694624,
+            150.38741007447243,
+            149.96553026139736,
+            114.27238769829273
+          ]
+        },
+        "refreshed": {
+          "cold_ms": 83.45626294612885,
+          "warm_ms": 58.30850824713707,
+          "cold_samples_ms": [
+            82.86427333950996,
+            83.62956903874874,
+            83.45626294612885
+          ],
+          "warm_samples_ms": [
+            58.30850824713707,
+            58.212652802467346,
+            66.55415892601013,
+            58.38269181549549,
+            58.307912200689316
+          ]
+        }
+      },
+      "inspections": {
+        "live": {
+          "plan": [
+            {
+              "plan": "HashAggregate group=[\"p\".\"subscription_plan\"]"
+            },
+            {
+              "plan": "  HashJoin [INNER] keys=(\"p\".\"player_id\" = \"active\".\"player_id\") build=Right rows=12018 stats=defaulted[ndv(t.player_id), eq_selectivity(gameplay.gameplay.events.event_name), group_ndv(gameplay.gameplay.events.player_id), ndv(active.player_id)]"
+            },
+            {
+              "plan": "    HashJoin [INNER] keys=(\"p\".\"player_id\" = \"t\".\"player_id\") build=Left rows=441 stats=defaulted[ndv(t.player_id)]"
+            },
+            {
+              "plan": "      Scan [billing] cost=10.48ms rows=300 stats=defaulted[avg_width] :: SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\""
+            },
+            {
+              "plan": "      Scan [crm] filter=(\"t\".\"player_id\" IN (...)) cost=11.06ms rows=441 stats=defaulted[avg_width] :: SELECT `player_id`, `category`, `handling_minutes` FROM `support`.`tickets` AS `t` WHERE (`t`.`category` = 'gameplay')"
+            },
+            {
+              "plan": "    AliasedRelation"
+            },
+            {
+              "plan": "      Scan [gameplay] +inject(player_id) cost=23.08ms rows=8176 stats=defaulted[avg_width] :: SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\""
+            }
+          ],
+          "rows": [
+            {
+              "subscription_plan": "annual",
+              "supported_players": 22,
+              "gameplay_tickets": 34,
+              "handling_minutes": 786
+            },
+            {
+              "subscription_plan": "monthly",
+              "supported_players": 53,
+              "gameplay_tickets": 90,
+              "handling_minutes": 2259
+            },
+            {
+              "subscription_plan": "free",
+              "supported_players": 140,
+              "gameplay_tickets": 239,
+              "handling_minutes": 5839
+            }
+          ],
+          "fragments": [
+            {
+              "datasource": "billing",
+              "source_sql": "SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\"",
+              "canonical_sql": "SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\"",
+              "output_names": "player_id, subscription_plan",
+              "has_dynamic_filter": false
+            },
+            {
+              "datasource": "crm",
+              "source_sql": "SELECT `player_id`, `category`, `handling_minutes` FROM `support`.`tickets` AS `t` WHERE (`t`.`category` = 'gameplay')",
+              "canonical_sql": "SELECT \"player_id\", \"category\", \"handling_minutes\" FROM \"support\".\"tickets\" AS \"t\" WHERE (\"t\".\"category\" = 'gameplay')",
+              "output_names": "player_id, category, handling_minutes",
+              "has_dynamic_filter": true
+            },
+            {
+              "datasource": "gameplay",
+              "source_sql": "SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\"",
+              "canonical_sql": "SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\"",
+              "output_names": "player_id",
+              "has_dynamic_filter": false
+            }
+          ],
+          "views": []
+        },
+        "cached": {
+          "plan": [
+            {
+              "plan": "MaterializedScan [studio_accelerator_support] cost=10.01ms rows=3 stats=defaulted[avg_width] :: SELECT \"subscription_plan\", \"supported_players\", \"gameplay_tickets\", \"handling_minutes\" FROM \"public\".\"studio_accelerator_support\""
+            }
+          ],
+          "rows": [
+            {
+              "subscription_plan": "annual",
+              "supported_players": 22,
+              "gameplay_tickets": 34,
+              "handling_minutes": 786
+            },
+            {
+              "subscription_plan": "monthly",
+              "supported_players": 53,
+              "gameplay_tickets": 90,
+              "handling_minutes": 2259
+            },
+            {
+              "subscription_plan": "free",
+              "supported_players": 140,
+              "gameplay_tickets": 239,
+              "handling_minutes": 5839
+            }
+          ],
+          "fragments": [
+            {
+              "datasource": "accel:/data/projects/fedq-public/benchmarks/perf_compare/results/game-studio-accelerator-run4/state/databases/a902f046-8727-4ba1-8496-c5c2d5f43bf5/materialized",
+              "source_sql": "SELECT \"subscription_plan\", \"supported_players\", \"gameplay_tickets\", \"handling_minutes\" FROM \"public\".\"studio_accelerator_support\"",
+              "canonical_sql": "SELECT \"subscription_plan\", \"supported_players\", \"gameplay_tickets\", \"handling_minutes\" FROM \"public\".\"studio_accelerator_support\"",
+              "output_names": "subscription_plan, supported_players, gameplay_tickets, handling_minutes",
+              "has_dynamic_filter": false
+            }
+          ],
+          "views": [
+            {
+              "name": "studio_accelerator_support",
+              "rows": 3,
+              "bytes": 2650,
+              "created": "2026-11-11T22:20:29.019249293+00:00",
+              "refreshed": null,
+              "use_count": 11,
+              "cost_saved": 98054.0
+            }
+          ]
+        },
+        "stale": {
+          "plan": [
+            {
+              "plan": "MaterializedScan [studio_accelerator_support] cost=10.01ms rows=3 stats=defaulted[avg_width] :: SELECT \"subscription_plan\", \"supported_players\", \"gameplay_tickets\", \"handling_minutes\" FROM \"public\".\"studio_accelerator_support\""
+            }
+          ],
+          "rows": [
+            {
+              "subscription_plan": "annual",
+              "supported_players": 22,
+              "gameplay_tickets": 34,
+              "handling_minutes": 786
+            },
+            {
+              "subscription_plan": "monthly",
+              "supported_players": 53,
+              "gameplay_tickets": 90,
+              "handling_minutes": 2259
+            },
+            {
+              "subscription_plan": "free",
+              "supported_players": 140,
+              "gameplay_tickets": 239,
+              "handling_minutes": 5839
+            }
+          ],
+          "fragments": [
+            {
+              "datasource": "accel:/data/projects/fedq-public/benchmarks/perf_compare/results/game-studio-accelerator-run4/state/databases/a902f046-8727-4ba1-8496-c5c2d5f43bf5/materialized",
+              "source_sql": "SELECT \"subscription_plan\", \"supported_players\", \"gameplay_tickets\", \"handling_minutes\" FROM \"public\".\"studio_accelerator_support\"",
+              "canonical_sql": "SELECT \"subscription_plan\", \"supported_players\", \"gameplay_tickets\", \"handling_minutes\" FROM \"public\".\"studio_accelerator_support\"",
+              "output_names": "subscription_plan, supported_players, gameplay_tickets, handling_minutes",
+              "has_dynamic_filter": false
+            }
+          ],
+          "views": [
+            {
+              "name": "studio_accelerator_support",
+              "rows": 3,
+              "bytes": 2650,
+              "created": "2026-11-11T22:20:29.019249293+00:00",
+              "refreshed": null,
+              "use_count": 22,
+              "cost_saved": 196108.0
+            }
+          ]
+        },
+        "bypass": {
+          "plan": [
+            {
+              "plan": "HashAggregate group=[\"p\".\"subscription_plan\"]"
+            },
+            {
+              "plan": "  HashJoin [INNER] keys=(\"p\".\"player_id\" = \"active\".\"player_id\") build=Right rows=12018 stats=defaulted[ndv(t.player_id), eq_selectivity(gameplay.gameplay.events.event_name), group_ndv(gameplay.gameplay.events.player_id), ndv(active.player_id)]"
+            },
+            {
+              "plan": "    HashJoin [INNER] keys=(\"p\".\"player_id\" = \"t\".\"player_id\") build=Left rows=441 stats=defaulted[ndv(t.player_id)]"
+            },
+            {
+              "plan": "      Scan [billing] cost=10.48ms rows=300 stats=defaulted[avg_width] :: SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\""
+            },
+            {
+              "plan": "      Scan [crm] filter=(\"t\".\"player_id\" IN (...)) cost=11.06ms rows=441 stats=defaulted[avg_width] :: SELECT `player_id`, `category`, `handling_minutes` FROM `support`.`tickets` AS `t` WHERE (`t`.`category` = 'gameplay')"
+            },
+            {
+              "plan": "    AliasedRelation"
+            },
+            {
+              "plan": "      Scan [gameplay] +inject(player_id) cost=23.08ms rows=8176 stats=defaulted[avg_width] :: SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\""
+            }
+          ],
+          "rows": [
+            {
+              "subscription_plan": "annual",
+              "supported_players": 22,
+              "gameplay_tickets": 34,
+              "handling_minutes": 786
+            },
+            {
+              "subscription_plan": "monthly",
+              "supported_players": 53,
+              "gameplay_tickets": 90,
+              "handling_minutes": 2259
+            },
+            {
+              "subscription_plan": "free",
+              "supported_players": 140,
+              "gameplay_tickets": 241,
+              "handling_minutes": 5879
+            }
+          ],
+          "fragments": [
+            {
+              "datasource": "billing",
+              "source_sql": "SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\"",
+              "canonical_sql": "SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\"",
+              "output_names": "player_id, subscription_plan",
+              "has_dynamic_filter": false
+            },
+            {
+              "datasource": "crm",
+              "source_sql": "SELECT `player_id`, `category`, `handling_minutes` FROM `support`.`tickets` AS `t` WHERE (`t`.`category` = 'gameplay')",
+              "canonical_sql": "SELECT \"player_id\", \"category\", \"handling_minutes\" FROM \"support\".\"tickets\" AS \"t\" WHERE (\"t\".\"category\" = 'gameplay')",
+              "output_names": "player_id, category, handling_minutes",
+              "has_dynamic_filter": true
+            },
+            {
+              "datasource": "gameplay",
+              "source_sql": "SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\"",
+              "canonical_sql": "SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\"",
+              "output_names": "player_id",
+              "has_dynamic_filter": false
+            }
+          ],
+          "views": [
+            {
+              "name": "studio_accelerator_support",
+              "rows": 3,
+              "bytes": 2650,
+              "created": "2026-11-11T22:20:29.019249293+00:00",
+              "refreshed": null,
+              "use_count": 22,
+              "cost_saved": 196108.0
+            }
+          ]
+        },
+        "refreshed": {
+          "plan": [
+            {
+              "plan": "MaterializedScan [studio_accelerator_support] cost=10.01ms rows=3 stats=defaulted[avg_width] :: SELECT \"subscription_plan\", \"supported_players\", \"gameplay_tickets\", \"handling_minutes\" FROM \"public\".\"studio_accelerator_support\""
+            }
+          ],
+          "rows": [
+            {
+              "subscription_plan": "annual",
+              "supported_players": 22,
+              "gameplay_tickets": 34,
+              "handling_minutes": 786
+            },
+            {
+              "subscription_plan": "monthly",
+              "supported_players": 53,
+              "gameplay_tickets": 90,
+              "handling_minutes": 2259
+            },
+            {
+              "subscription_plan": "free",
+              "supported_players": 140,
+              "gameplay_tickets": 241,
+              "handling_minutes": 5879
+            }
+          ],
+          "fragments": [
+            {
+              "datasource": "accel:/data/projects/fedq-public/benchmarks/perf_compare/results/game-studio-accelerator-run4/state/databases/a902f046-8727-4ba1-8496-c5c2d5f43bf5/materialized",
+              "source_sql": "SELECT \"subscription_plan\", \"supported_players\", \"gameplay_tickets\", \"handling_minutes\" FROM \"public\".\"studio_accelerator_support\"",
+              "canonical_sql": "SELECT \"subscription_plan\", \"supported_players\", \"gameplay_tickets\", \"handling_minutes\" FROM \"public\".\"studio_accelerator_support\"",
+              "output_names": "subscription_plan, supported_players, gameplay_tickets, handling_minutes",
+              "has_dynamic_filter": false
+            }
+          ],
+          "views": [
+            {
+              "name": "studio_accelerator_support",
+              "rows": 3,
+              "bytes": 2650,
+              "created": "2026-11-11T22:20:29.019249293+00:00",
+              "refreshed": "2026-11-11T22:20:38.488183834+00:00",
+              "use_count": 33,
+              "cost_saved": 294162.0
+            }
+          ]
+        }
+      },
+      "chunks": {
+        "cached": [
+          {
+            "file": "state/databases/a902f046-8727-4ba1-8496-c5c2d5f43bf5/materialized/studio_accelerator_support-f7b113e5e3d975f3/chunk-0-0.arrow",
+            "bytes": 2650,
+            "sha256": "3369b9be63bcf1696e2bf0a407a7cdfc25c9e67415233a5a920078776143f681"
+          }
+        ],
+        "stale": [
+          {
+            "file": "state/databases/a902f046-8727-4ba1-8496-c5c2d5f43bf5/materialized/studio_accelerator_support-f7b113e5e3d975f3/chunk-0-0.arrow",
+            "bytes": 2650,
+            "sha256": "3369b9be63bcf1696e2bf0a407a7cdfc25c9e67415233a5a920078776143f681"
+          }
+        ],
+        "refreshed": [
+          {
+            "file": "state/databases/a902f046-8727-4ba1-8496-c5c2d5f43bf5/materialized/studio_accelerator_support-f7b113e5e3d975f3/chunk-10-0.arrow",
+            "bytes": 2650,
+            "sha256": "c3b0c48be5bf65fa455adbf549f34e2090e9486a16ae9fcb4238275e86e41016"
+          }
+        ]
+      },
+      "refresh": {
+        "previous_select_fragments_after_refresh_ddl": [
+          {
+            "datasource": "billing",
+            "source_sql": "SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\"",
+            "canonical_sql": "SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\"",
+            "output_names": "player_id, subscription_plan",
+            "has_dynamic_filter": false
+          },
+          {
+            "datasource": "crm",
+            "source_sql": "SELECT `player_id`, `category`, `handling_minutes` FROM `support`.`tickets` AS `t` WHERE (`t`.`category` = 'gameplay')",
+            "canonical_sql": "SELECT \"player_id\", \"category\", \"handling_minutes\" FROM \"support\".\"tickets\" AS \"t\" WHERE (\"t\".\"category\" = 'gameplay')",
+            "output_names": "player_id, category, handling_minutes",
+            "has_dynamic_filter": true
+          },
+          {
+            "datasource": "gameplay",
+            "source_sql": "SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\"",
+            "canonical_sql": "SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\"",
+            "output_names": "player_id",
+            "has_dynamic_filter": false
+          }
+        ],
+        "views": [
+          {
+            "name": "studio_accelerator_support",
+            "rows": 3,
+            "bytes": 2650,
+            "created": "2026-11-11T22:20:29.019249293+00:00",
+            "refreshed": "2026-11-11T22:20:38.488183834+00:00",
+            "use_count": 22,
+            "cost_saved": 196108.0
+          }
+        ],
+        "note": "CREATE/REFRESH do not replace the SELECT fragment journal; inspect the actual SQL trace in live.server.log."
+      },
+      "executed_statements": 175,
+      "completed": true,
+      "restored": true,
+      "samples": [
+        {
+          "phase": "live",
+          "mode": "cold",
+          "index": 0,
+          "status": "OK",
+          "ms": 96.44683636724949
+        },
+        {
+          "phase": "live",
+          "mode": "cold",
+          "index": 1,
+          "status": "OK",
+          "ms": 185.08590012788773
+        },
+        {
+          "phase": "live",
+          "mode": "cold",
+          "index": 2,
+          "status": "OK",
+          "ms": 112.99842037260532
+        },
+        {
+          "phase": "live",
+          "mode": "warmup",
+          "index": 0,
+          "status": "OK"
+        },
+        {
+          "phase": "live",
+          "mode": "warmup",
+          "index": 1,
+          "status": "OK"
+        },
+        {
+          "phase": "live",
+          "mode": "warm",
+          "index": 2,
+          "status": "OK",
+          "ms": 15.072895213961601
+        },
+        {
+          "phase": "live",
+          "mode": "warm",
+          "index": 3,
+          "status": "OK",
+          "ms": 14.066901057958603
+        },
+        {
+          "phase": "live",
+          "mode": "warm",
+          "index": 4,
+          "status": "OK",
+          "ms": 13.402886688709259
+        },
+        {
+          "phase": "live",
+          "mode": "warm",
+          "index": 5,
+          "status": "OK",
+          "ms": 14.274036511778831
+        },
+        {
+          "phase": "live",
+          "mode": "warm",
+          "index": 6,
+          "status": "OK",
+          "ms": 13.865955173969269
+        },
+        {
+          "phase": "build",
+          "mode": "cold",
+          "index": 0,
+          "status": "OK",
+          "ms": 352.2945027798414
+        },
+        {
+          "phase": "build",
+          "mode": "cold",
+          "index": 1,
+          "status": "OK",
+          "ms": 241.20144546031952
+        },
+        {
+          "phase": "build",
+          "mode": "cold",
+          "index": 2,
+          "status": "OK",
+          "ms": 300.80416426062584
+        },
+        {
+          "phase": "build",
+          "mode": "warmup",
+          "index": 0,
+          "status": "OK"
+        },
+        {
+          "phase": "build",
+          "mode": "warmup",
+          "index": 1,
+          "status": "OK"
+        },
+        {
+          "phase": "build",
+          "mode": "warm",
+          "index": 2,
+          "status": "OK",
+          "ms": 226.0645404458046
+        },
+        {
+          "phase": "build",
+          "mode": "warm",
+          "index": 3,
+          "status": "OK",
+          "ms": 209.07155983150005
+        },
+        {
+          "phase": "build",
+          "mode": "warm",
+          "index": 4,
+          "status": "OK",
+          "ms": 251.10176764428616
+        },
+        {
+          "phase": "build",
+          "mode": "warm",
+          "index": 5,
+          "status": "OK",
+          "ms": 184.41746570169926
+        },
+        {
+          "phase": "build",
+          "mode": "warm",
+          "index": 6,
+          "status": "OK",
+          "ms": 332.63038098812103
+        },
+        {
+          "phase": "cached",
+          "mode": "cold",
+          "index": 0,
+          "status": "OK",
+          "ms": 83.60995166003704
+        },
+        {
+          "phase": "cached",
+          "mode": "cold",
+          "index": 1,
+          "status": "OK",
+          "ms": 83.54624547064304
+        },
+        {
+          "phase": "cached",
+          "mode": "cold",
+          "index": 2,
+          "status": "OK",
+          "ms": 75.33111423254013
+        },
+        {
+          "phase": "cached",
+          "mode": "warmup",
+          "index": 0,
+          "status": "OK"
+        },
+        {
+          "phase": "cached",
+          "mode": "warmup",
+          "index": 1,
+          "status": "OK"
+        },
+        {
+          "phase": "cached",
+          "mode": "warm",
+          "index": 2,
+          "status": "OK",
+          "ms": 50.089770928025246
+        },
+        {
+          "phase": "cached",
+          "mode": "warm",
+          "index": 3,
+          "status": "OK",
+          "ms": 58.33398550748825
+        },
+        {
+          "phase": "cached",
+          "mode": "warm",
+          "index": 4,
+          "status": "OK",
+          "ms": 58.13111923635006
+        },
+        {
+          "phase": "cached",
+          "mode": "warm",
+          "index": 5,
+          "status": "OK",
+          "ms": 58.39816480875015
+        },
+        {
+          "phase": "cached",
+          "mode": "warm",
+          "index": 6,
+          "status": "OK",
+          "ms": 58.25633183121681
+        },
+        {
+          "phase": "stale",
+          "mode": "cold",
+          "index": 0,
+          "status": "OK",
+          "ms": 66.75547361373901
+        },
+        {
+          "phase": "stale",
+          "mode": "cold",
+          "index": 1,
+          "status": "OK",
+          "ms": 83.52478966116905
+        },
+        {
+          "phase": "stale",
+          "mode": "cold",
+          "index": 2,
+          "status": "OK",
+          "ms": 75.13314858078957
+        },
+        {
+          "phase": "stale",
+          "mode": "warmup",
+          "index": 0,
+          "status": "OK"
+        },
+        {
+          "phase": "stale",
+          "mode": "warmup",
+          "index": 1,
+          "status": "OK"
+        },
+        {
+          "phase": "stale",
+          "mode": "warm",
+          "index": 2,
+          "status": "OK",
+          "ms": 58.367760851979256
+        },
+        {
+          "phase": "stale",
+          "mode": "warm",
+          "index": 3,
+          "status": "OK",
+          "ms": 58.235082775354385
+        },
+        {
+          "phase": "stale",
+          "mode": "warm",
+          "index": 4,
+          "status": "OK",
+          "ms": 58.15143883228302
+        },
+        {
+          "phase": "stale",
+          "mode": "warm",
+          "index": 5,
+          "status": "OK",
+          "ms": 58.32540802657604
+        },
+        {
+          "phase": "stale",
+          "mode": "warm",
+          "index": 6,
+          "status": "OK",
+          "ms": 58.30814689397812
+        },
+        {
+          "phase": "bypass",
+          "mode": "cold",
+          "index": 0,
+          "status": "OK",
+          "ms": 91.14564768970013
+        },
+        {
+          "phase": "bypass",
+          "mode": "cold",
+          "index": 1,
+          "status": "OK",
+          "ms": 157.51680731773376
+        },
+        {
+          "phase": "bypass",
+          "mode": "cold",
+          "index": 2,
+          "status": "OK",
+          "ms": 162.66696900129318
+        },
+        {
+          "phase": "bypass",
+          "mode": "warmup",
+          "index": 0,
+          "status": "OK"
+        },
+        {
+          "phase": "bypass",
+          "mode": "warmup",
+          "index": 1,
+          "status": "OK"
+        },
+        {
+          "phase": "bypass",
+          "mode": "warm",
+          "index": 2,
+          "status": "OK",
+          "ms": 16.11252687871456
+        },
+        {
+          "phase": "bypass",
+          "mode": "warm",
+          "index": 3,
+          "status": "OK",
+          "ms": 15.603918582201004
+        },
+        {
+          "phase": "bypass",
+          "mode": "warm",
+          "index": 4,
+          "status": "OK",
+          "ms": 15.624778345227242
+        },
+        {
+          "phase": "bypass",
+          "mode": "warm",
+          "index": 5,
+          "status": "OK",
+          "ms": 16.214514151215553
+        },
+        {
+          "phase": "bypass",
+          "mode": "warm",
+          "index": 6,
+          "status": "OK",
+          "ms": 16.834910959005356
+        },
+        {
+          "phase": "refresh",
+          "mode": "cold",
+          "index": 0,
+          "status": "OK",
+          "ms": 209.54295061528683
+        },
+        {
+          "phase": "refresh",
+          "mode": "cold",
+          "index": 1,
+          "status": "OK",
+          "ms": 201.2075763195753
+        },
+        {
+          "phase": "refresh",
+          "mode": "cold",
+          "index": 2,
+          "status": "OK",
+          "ms": 211.1557051539421
+        },
+        {
+          "phase": "refresh",
+          "mode": "warmup",
+          "index": 0,
+          "status": "OK"
+        },
+        {
+          "phase": "refresh",
+          "mode": "warmup",
+          "index": 1,
+          "status": "OK"
+        },
+        {
+          "phase": "refresh",
+          "mode": "warm",
+          "index": 2,
+          "status": "OK",
+          "ms": 77.35218107700348
+        },
+        {
+          "phase": "refresh",
+          "mode": "warm",
+          "index": 3,
+          "status": "OK",
+          "ms": 157.7081959694624
+        },
+        {
+          "phase": "refresh",
+          "mode": "warm",
+          "index": 4,
+          "status": "OK",
+          "ms": 150.38741007447243
+        },
+        {
+          "phase": "refresh",
+          "mode": "warm",
+          "index": 5,
+          "status": "OK",
+          "ms": 149.96553026139736
+        },
+        {
+          "phase": "refresh",
+          "mode": "warm",
+          "index": 6,
+          "status": "OK",
+          "ms": 114.27238769829273
+        },
+        {
+          "phase": "refreshed",
+          "mode": "cold",
+          "index": 0,
+          "status": "OK",
+          "ms": 82.86427333950996
+        },
+        {
+          "phase": "refreshed",
+          "mode": "cold",
+          "index": 1,
+          "status": "OK",
+          "ms": 83.62956903874874
+        },
+        {
+          "phase": "refreshed",
+          "mode": "cold",
+          "index": 2,
+          "status": "OK",
+          "ms": 83.45626294612885
+        },
+        {
+          "phase": "refreshed",
+          "mode": "warmup",
+          "index": 0,
+          "status": "OK"
+        },
+        {
+          "phase": "refreshed",
+          "mode": "warmup",
+          "index": 1,
+          "status": "OK"
+        },
+        {
+          "phase": "refreshed",
+          "mode": "warm",
+          "index": 2,
+          "status": "OK",
+          "ms": 58.30850824713707
+        },
+        {
+          "phase": "refreshed",
+          "mode": "warm",
+          "index": 3,
+          "status": "OK",
+          "ms": 58.212652802467346
+        },
+        {
+          "phase": "refreshed",
+          "mode": "warm",
+          "index": 4,
+          "status": "OK",
+          "ms": 66.55415892601013
+        },
+        {
+          "phase": "refreshed",
+          "mode": "warm",
+          "index": 5,
+          "status": "OK",
+          "ms": 58.38269181549549
+        },
+        {
+          "phase": "refreshed",
+          "mode": "warm",
+          "index": 6,
+          "status": "OK",
+          "ms": 58.307912200689316
+        }
+      ]
+    }
+  ]
+}

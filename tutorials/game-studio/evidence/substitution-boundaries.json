@@ -1,0 +1,1986 @@
+{
+  "checks": [
+    {
+      "case": "matching support query",
+      "view": "studio_support_boundary",
+      "sql": "SELECT p.subscription_plan,\n       COUNT(DISTINCT p.player_id) AS supported_players,\n       COUNT(*) AS gameplay_tickets,\n       SUM(t.handling_minutes) AS handling_minutes\nFROM billing.public.players AS p\nJOIN crm.support.tickets AS t ON p.player_id = t.player_id\nJOIN (\n    SELECT e.player_id\n    FROM gameplay.gameplay.events AS e\n    WHERE e.event_name = 'session_start'\n    GROUP BY e.player_id\n) AS active ON p.player_id = active.player_id\nWHERE t.category = 'gameplay'\nGROUP BY p.subscription_plan",
+      "substituted": true,
+      "plan": [
+        {
+          "plan": "MaterializedScan [studio_support_boundary] cost=10.01ms rows=3 stats=defaulted[avg_width] :: SELECT \"subscription_plan\", \"supported_players\", \"gameplay_tickets\", \"handling_minutes\" FROM \"public\".\"studio_support_boundary\""
+        }
+      ],
+      "rows": [
+        {
+          "subscription_plan": "free",
+          "supported_players": 140,
+          "gameplay_tickets": 239,
+          "handling_minutes": 5839
+        },
+        {
+          "subscription_plan": "annual",
+          "supported_players": 22,
+          "gameplay_tickets": 34,
+          "handling_minutes": 786
+        },
+        {
+          "subscription_plan": "monthly",
+          "supported_players": 53,
+          "gameplay_tickets": 90,
+          "handling_minutes": 2259
+        }
+      ],
+      "fragments": [
+        {
+          "datasource": "accel:/data/projects/fedq-public/tutorials/game-studio/generated/fedq-state/databases/e9c20089-4352-481f-bae2-0676277884d3/materialized",
+          "source_sql": "SELECT \"subscription_plan\", \"supported_players\", \"gameplay_tickets\", \"handling_minutes\" FROM \"public\".\"studio_support_boundary\"",
+          "canonical_sql": "SELECT \"subscription_plan\", \"supported_players\", \"gameplay_tickets\", \"handling_minutes\" FROM \"public\".\"studio_support_boundary\"",
+          "output_names": "subscription_plan, supported_players, gameplay_tickets, handling_minutes",
+          "has_dynamic_filter": false
+        }
+      ],
+      "use_count_before": 0,
+      "use_count_after": 1
+    },
+    {
+      "case": "changed predicate",
+      "view": "studio_support_boundary",
+      "sql": "SELECT p.subscription_plan,\n       COUNT(DISTINCT p.player_id) AS supported_players,\n       COUNT(*) AS gameplay_tickets,\n       SUM(t.handling_minutes) AS handling_minutes\nFROM billing.public.players AS p\nJOIN crm.support.tickets AS t ON p.player_id = t.player_id\nJOIN (\n    SELECT e.player_id\n    FROM gameplay.gameplay.events AS e\n    WHERE e.event_name = 'session_start'\n    GROUP BY e.player_id\n) AS active ON p.player_id = active.player_id\nWHERE t.category = 'billing'\nGROUP BY p.subscription_plan",
+      "substituted": false,
+      "plan": [
+        {
+          "plan": "HashAggregate group=[\"p\".\"subscription_plan\"]"
+        },
+        {
+          "plan": "  HashJoin [INNER] keys=(\"p\".\"player_id\" = \"active\".\"player_id\") build=Right rows=9892 stats=defaulted[ndv(t.player_id), eq_selectivity(gameplay.gameplay.events.event_name), group_ndv(gameplay.gameplay.events.player_id), ndv(active.player_id)]"
+        },
+        {
+          "plan": "    HashJoin [INNER] keys=(\"p\".\"player_id\" = \"t\".\"player_id\") build=Left rows=363 stats=defaulted[ndv(t.player_id)]"
+        },
+        {
+          "plan": "      Scan [billing] cost=10.48ms rows=300 stats=defaulted[avg_width] :: SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\""
+        },
+        {
+          "plan": "      Scan [crm] filter=(\"t\".\"player_id\" IN (...)) cost=10.87ms rows=363 stats=defaulted[avg_width] :: SELECT `player_id`, `category`, `handling_minutes` FROM `support`.`tickets` AS `t` WHERE (`t`.`category` = 'billing')"
+        },
+        {
+          "plan": "    AliasedRelation"
+        },
+        {
+          "plan": "      Scan [gameplay] +inject(player_id) cost=23.08ms rows=8176 stats=defaulted[avg_width] :: SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\""
+        }
+      ],
+      "rows": [
+        {
+          "subscription_plan": "monthly",
+          "supported_players": 22,
+          "gameplay_tickets": 22,
+          "handling_minutes": 581
+        },
+        {
+          "subscription_plan": "annual",
+          "supported_players": 9,
+          "gameplay_tickets": 9,
+          "handling_minutes": 205
+        },
+        {
+          "subscription_plan": "free",
+          "supported_players": 47,
+          "gameplay_tickets": 47,
+          "handling_minutes": 1087
+        }
+      ],
+      "fragments": [
+        {
+          "datasource": "billing",
+          "source_sql": "SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\"",
+          "canonical_sql": "SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\"",
+          "output_names": "player_id, subscription_plan",
+          "has_dynamic_filter": false
+        },
+        {
+          "datasource": "crm",
+          "source_sql": "SELECT `player_id`, `category`, `handling_minutes` FROM `support`.`tickets` AS `t` WHERE (`t`.`category` = 'billing')",
+          "canonical_sql": "SELECT \"player_id\", \"category\", \"handling_minutes\" FROM \"support\".\"tickets\" AS \"t\" WHERE (\"t\".\"category\" = 'billing')",
+          "output_names": "player_id, category, handling_minutes",
+          "has_dynamic_filter": true
+        },
+        {
+          "datasource": "gameplay",
+          "source_sql": "SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\"",
+          "canonical_sql": "SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\"",
+          "output_names": "player_id",
+          "has_dynamic_filter": false
+        }
+      ],
+      "use_count_before": 1,
+      "use_count_after": 1
+    },
+    {
+      "case": "additional filter",
+      "view": "studio_support_boundary",
+      "sql": "SELECT p.subscription_plan,\n       COUNT(DISTINCT p.player_id) AS supported_players,\n       COUNT(*) AS gameplay_tickets,\n       SUM(t.handling_minutes) AS handling_minutes\nFROM billing.public.players AS p\nJOIN crm.support.tickets AS t ON p.player_id = t.player_id\nJOIN (\n    SELECT e.player_id\n    FROM gameplay.gameplay.events AS e\n    WHERE e.event_name = 'session_start'\n    GROUP BY e.player_id\n) AS active ON p.player_id = active.player_id\nWHERE t.category = 'gameplay' AND t.handling_minutes > 30\nGROUP BY p.subscription_plan",
+      "substituted": false,
+      "plan": [
+        {
+          "plan": "HashAggregate group=[\"p\".\"subscription_plan\"]"
+        },
+        {
+          "plan": "  HashJoin [INNER] keys=(\"p\".\"player_id\" = \"active\".\"player_id\") build=Right rows=12018 stats=defaulted[ndv(t.player_id), eq_selectivity(gameplay.gameplay.events.event_name), group_ndv(gameplay.gameplay.events.player_id), ndv(active.player_id)]"
+        },
+        {
+          "plan": "    HashJoin [INNER] keys=(\"p\".\"player_id\" = \"t\".\"player_id\") build=Left rows=441 stats=defaulted[ndv(t.player_id)]"
+        },
+        {
+          "plan": "      Scan [billing] cost=10.48ms rows=300 stats=defaulted[avg_width] :: SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\""
+        },
+        {
+          "plan": "      Scan [crm] filter=(\"t\".\"player_id\" IN (...)) cost=11.06ms rows=441 stats=defaulted[avg_width] :: SELECT `player_id`, `category`, `handling_minutes` FROM `support`.`tickets` AS `t` WHERE ((`t`.`category` = 'gameplay') AND (`t`.`handling_minutes` > 30))"
+        },
+        {
+          "plan": "    AliasedRelation"
+        },
+        {
+          "plan": "      Scan [gameplay] +inject(player_id) cost=23.08ms rows=8176 stats=defaulted[avg_width] :: SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\""
+        }
+      ],
+      "rows": [
+        {
+          "subscription_plan": "free",
+          "supported_players": 66,
+          "gameplay_tickets": 79,
+          "handling_minutes": 3065
+        },
+        {
+          "subscription_plan": "annual",
+          "supported_players": 9,
+          "gameplay_tickets": 9,
+          "handling_minutes": 348
+        },
+        {
+          "subscription_plan": "monthly",
+          "supported_players": 26,
+          "gameplay_tickets": 32,
+          "handling_minutes": 1214
+        }
+      ],
+      "fragments": [
+        {
+          "datasource": "billing",
+          "source_sql": "SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\"",
+          "canonical_sql": "SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\"",
+          "output_names": "player_id, subscription_plan",
+          "has_dynamic_filter": false
+        },
+        {
+          "datasource": "crm",
+          "source_sql": "SELECT `player_id`, `category`, `handling_minutes` FROM `support`.`tickets` AS `t` WHERE ((`t`.`category` = 'gameplay') AND (`t`.`handling_minutes` > 30))",
+          "canonical_sql": "SELECT \"player_id\", \"category\", \"handling_minutes\" FROM \"support\".\"tickets\" AS \"t\" WHERE ((\"t\".\"category\" = 'gameplay') AND (\"t\".\"handling_minutes\" > 30))",
+          "output_names": "player_id, category, handling_minutes",
+          "has_dynamic_filter": true
+        },
+        {
+          "datasource": "gameplay",
+          "source_sql": "SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\"",
+          "canonical_sql": "SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\"",
+          "output_names": "player_id",
+          "has_dynamic_filter": false
+        }
+      ],
+      "use_count_before": 1,
+      "use_count_after": 1
+    },
+    {
+      "case": "changed output name",
+      "view": "studio_support_boundary",
+      "sql": "SELECT p.subscription_plan,\n       COUNT(DISTINCT p.player_id) AS supported_players,\n       COUNT(*) AS ticket_count,\n       SUM(t.handling_minutes) AS handling_minutes\nFROM billing.public.players AS p\nJOIN crm.support.tickets AS t ON p.player_id = t.player_id\nJOIN (\n    SELECT e.player_id\n    FROM gameplay.gameplay.events AS e\n    WHERE e.event_name = 'session_start'\n    GROUP BY e.player_id\n) AS active ON p.player_id = active.player_id\nWHERE t.category = 'gameplay'\nGROUP BY p.subscription_plan",
+      "substituted": false,
+      "plan": [
+        {
+          "plan": "HashAggregate group=[\"p\".\"subscription_plan\"]"
+        },
+        {
+          "plan": "  HashJoin [INNER] keys=(\"p\".\"player_id\" = \"active\".\"player_id\") build=Right rows=9892 stats=defaulted[ndv(t.player_id), eq_selectivity(gameplay.gameplay.events.event_name), group_ndv(gameplay.gameplay.events.player_id), ndv(active.player_id)]"
+        },
+        {
+          "plan": "    HashJoin [INNER] keys=(\"p\".\"player_id\" = \"t\".\"player_id\") build=Left rows=363 stats=defaulted[ndv(t.player_id)]"
+        },
+        {
+          "plan": "      Scan [billing] cost=10.48ms rows=300 stats=defaulted[avg_width] :: SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\""
+        },
+        {
+          "plan": "      Scan [crm] filter=(\"t\".\"player_id\" IN (...)) cost=10.87ms rows=363 stats=defaulted[avg_width] :: SELECT `player_id`, `category`, `handling_minutes` FROM `support`.`tickets` AS `t` WHERE (`t`.`category` = 'gameplay')"
+        },
+        {
+          "plan": "    AliasedRelation"
+        },
+        {
+          "plan": "      Scan [gameplay] +inject(player_id) cost=23.08ms rows=8176 stats=defaulted[avg_width] :: SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\""
+        }
+      ],
+      "rows": [
+        {
+          "subscription_plan": "free",
+          "supported_players": 140,
+          "ticket_count": 239,
+          "handling_minutes": 5839
+        },
+        {
+          "subscription_plan": "annual",
+          "supported_players": 22,
+          "ticket_count": 34,
+          "handling_minutes": 786
+        },
+        {
+          "subscription_plan": "monthly",
+          "supported_players": 53,
+          "ticket_count": 90,
+          "handling_minutes": 2259
+        }
+      ],
+      "fragments": [
+        {
+          "datasource": "billing",
+          "source_sql": "SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\"",
+          "canonical_sql": "SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\"",
+          "output_names": "player_id, subscription_plan",
+          "has_dynamic_filter": false
+        },
+        {
+          "datasource": "crm",
+          "source_sql": "SELECT `player_id`, `category`, `handling_minutes` FROM `support`.`tickets` AS `t` WHERE (`t`.`category` = 'gameplay')",
+          "canonical_sql": "SELECT \"player_id\", \"category\", \"handling_minutes\" FROM \"support\".\"tickets\" AS \"t\" WHERE (\"t\".\"category\" = 'gameplay')",
+          "output_names": "player_id, category, handling_minutes",
+          "has_dynamic_filter": true
+        },
+        {
+          "datasource": "gameplay",
+          "source_sql": "SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\"",
+          "canonical_sql": "SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\"",
+          "output_names": "player_id",
+          "has_dynamic_filter": false
+        }
+      ],
+      "use_count_before": 1,
+      "use_count_after": 1
+    },
+    {
+      "case": "fewer columns",
+      "view": "studio_support_boundary",
+      "sql": "SELECT p.subscription_plan,\n       COUNT(*) AS gameplay_tickets,\n       SUM(t.handling_minutes) AS handling_minutes\nFROM billing.public.players AS p\nJOIN crm.support.tickets AS t ON p.player_id = t.player_id\nJOIN (\n    SELECT e.player_id\n    FROM gameplay.gameplay.events AS e\n    WHERE e.event_name = 'session_start'\n    GROUP BY e.player_id\n) AS active ON p.player_id = active.player_id\nWHERE t.category = 'gameplay'\nGROUP BY p.subscription_plan",
+      "substituted": false,
+      "plan": [
+        {
+          "plan": "HashAggregate group=[\"p\".\"subscription_plan\"]"
+        },
+        {
+          "plan": "  HashJoin [INNER] keys=(\"p\".\"player_id\" = \"active\".\"player_id\") build=Right rows=9892 stats=defaulted[ndv(t.player_id), eq_selectivity(gameplay.gameplay.events.event_name), group_ndv(gameplay.gameplay.events.player_id), ndv(active.player_id)]"
+        },
+        {
+          "plan": "    HashJoin [INNER] keys=(\"p\".\"player_id\" = \"t\".\"player_id\") build=Left rows=363 stats=defaulted[ndv(t.player_id)]"
+        },
+        {
+          "plan": "      Scan [billing] cost=10.48ms rows=300 stats=defaulted[avg_width] :: SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\""
+        },
+        {
+          "plan": "      Scan [crm] filter=(\"t\".\"player_id\" IN (...)) cost=10.87ms rows=363 stats=defaulted[avg_width] :: SELECT `player_id`, `category`, `handling_minutes` FROM `support`.`tickets` AS `t` WHERE (`t`.`category` = 'gameplay')"
+        },
+        {
+          "plan": "    AliasedRelation"
+        },
+        {
+          "plan": "      Scan [gameplay] +inject(player_id) cost=23.08ms rows=8176 stats=defaulted[avg_width] :: SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\""
+        }
+      ],
+      "rows": [
+        {
+          "subscription_plan": "free",
+          "gameplay_tickets": 239,
+          "handling_minutes": 5839
+        },
+        {
+          "subscription_plan": "annual",
+          "gameplay_tickets": 34,
+          "handling_minutes": 786
+        },
+        {
+          "subscription_plan": "monthly",
+          "gameplay_tickets": 90,
+          "handling_minutes": 2259
+        }
+      ],
+      "fragments": [
+        {
+          "datasource": "billing",
+          "source_sql": "SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\"",
+          "canonical_sql": "SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\"",
+          "output_names": "player_id, subscription_plan",
+          "has_dynamic_filter": false
+        },
+        {
+          "datasource": "crm",
+          "source_sql": "SELECT `player_id`, `category`, `handling_minutes` FROM `support`.`tickets` AS `t` WHERE (`t`.`category` = 'gameplay')",
+          "canonical_sql": "SELECT \"player_id\", \"category\", \"handling_minutes\" FROM \"support\".\"tickets\" AS \"t\" WHERE (\"t\".\"category\" = 'gameplay')",
+          "output_names": "player_id, category, handling_minutes",
+          "has_dynamic_filter": true
+        },
+        {
+          "datasource": "gameplay",
+          "source_sql": "SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\"",
+          "canonical_sql": "SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\"",
+          "output_names": "player_id",
+          "has_dynamic_filter": false
+        }
+      ],
+      "use_count_before": 1,
+      "use_count_after": 1
+    },
+    {
+      "case": "session disabled",
+      "view": "studio_disabled_boundary",
+      "sql": "SELECT p.subscription_plan,\n       COUNT(DISTINCT p.player_id) AS supported_players,\n       COUNT(*) AS gameplay_tickets,\n       SUM(t.handling_minutes) AS handling_minutes\nFROM billing.public.players AS p\nJOIN crm.support.tickets AS t ON p.player_id = t.player_id\nJOIN (\n    SELECT e.player_id\n    FROM gameplay.gameplay.events AS e\n    WHERE e.event_name = 'session_start'\n    GROUP BY e.player_id\n) AS active ON p.player_id = active.player_id\nWHERE t.category = 'gameplay'\nGROUP BY p.subscription_plan",
+      "substituted": false,
+      "plan": [
+        {
+          "plan": "HashAggregate group=[\"p\".\"subscription_plan\"]"
+        },
+        {
+          "plan": "  HashJoin [INNER] keys=(\"p\".\"player_id\" = \"active\".\"player_id\") build=Right rows=9892 stats=defaulted[ndv(t.player_id), eq_selectivity(gameplay.gameplay.events.event_name), group_ndv(gameplay.gameplay.events.player_id), ndv(active.player_id)]"
+        },
+        {
+          "plan": "    HashJoin [INNER] keys=(\"p\".\"player_id\" = \"t\".\"player_id\") build=Left rows=363 stats=defaulted[ndv(t.player_id)]"
+        },
+        {
+          "plan": "      Scan [billing] cost=10.48ms rows=300 stats=defaulted[avg_width] :: SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\""
+        },
+        {
+          "plan": "      Scan [crm] filter=(\"t\".\"player_id\" IN (...)) cost=10.87ms rows=363 stats=defaulted[avg_width] :: SELECT `player_id`, `category`, `handling_minutes` FROM `support`.`tickets` AS `t` WHERE (`t`.`category` = 'gameplay')"
+        },
+        {
+          "plan": "    AliasedRelation"
+        },
+        {
+          "plan": "      Scan [gameplay] +inject(player_id) cost=23.08ms rows=8176 stats=defaulted[avg_width] :: SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\""
+        }
+      ],
+      "rows": [
+        {
+          "subscription_plan": "free",
+          "supported_players": 140,
+          "gameplay_tickets": 239,
+          "handling_minutes": 5839
+        },
+        {
+          "subscription_plan": "annual",
+          "supported_players": 22,
+          "gameplay_tickets": 34,
+          "handling_minutes": 786
+        },
+        {
+          "subscription_plan": "monthly",
+          "supported_players": 53,
+          "gameplay_tickets": 90,
+          "handling_minutes": 2259
+        }
+      ],
+      "fragments": [
+        {
+          "datasource": "billing",
+          "source_sql": "SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\"",
+          "canonical_sql": "SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\"",
+          "output_names": "player_id, subscription_plan",
+          "has_dynamic_filter": false
+        },
+        {
+          "datasource": "crm",
+          "source_sql": "SELECT `player_id`, `category`, `handling_minutes` FROM `support`.`tickets` AS `t` WHERE (`t`.`category` = 'gameplay')",
+          "canonical_sql": "SELECT \"player_id\", \"category\", \"handling_minutes\" FROM \"support\".\"tickets\" AS \"t\" WHERE (\"t\".\"category\" = 'gameplay')",
+          "output_names": "player_id, category, handling_minutes",
+          "has_dynamic_filter": true
+        },
+        {
+          "datasource": "gameplay",
+          "source_sql": "SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\"",
+          "canonical_sql": "SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\"",
+          "output_names": "player_id",
+          "has_dynamic_filter": false
+        }
+      ],
+      "use_count_before": 0,
+      "use_count_after": 0
+    },
+    {
+      "case": "cost gate",
+      "view": "studio_players_boundary",
+      "sql": "SELECT p.player_id, p.subscription_plan FROM billing.public.players AS p",
+      "substituted": false,
+      "plan": [
+        {
+          "plan": "Projection"
+        },
+        {
+          "plan": "  Scan [billing] cost=10.48ms rows=300 stats=defaulted[avg_width] :: SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\""
+        }
+      ],
+      "rows": [
+        {
+          "player_id": 1,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 2,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 3,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 4,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 5,
+          "subscription_plan": "annual"
+        },
+        {
+          "player_id": 6,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 7,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 8,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 9,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 10,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 11,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 12,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 13,
+          "subscription_plan": "annual"
+        },
+        {
+          "player_id": 14,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 15,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 16,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 17,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 18,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 19,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 20,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 21,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 22,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 23,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 24,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 25,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 26,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 27,
+          "subscription_plan": "annual"
+        },
+        {
+          "player_id": 28,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 29,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 30,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 31,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 32,
+          "subscription_plan": "annual"
+        },
+        {
+          "player_id": 33,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 34,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 35,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 36,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 37,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 38,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 39,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 40,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 41,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 42,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 43,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 44,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 45,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 46,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 47,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 48,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 49,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 50,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 51,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 52,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 53,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 54,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 55,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 56,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 57,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 58,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 59,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 60,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 61,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 62,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 63,
+          "subscription_plan": "annual"
+        },
+        {
+          "player_id": 64,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 65,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 66,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 67,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 68,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 69,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 70,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 71,
+          "subscription_plan": "annual"
+        },
+        {
+          "player_id": 72,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 73,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 74,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 75,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 76,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 77,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 78,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 79,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 80,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 81,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 82,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 83,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 84,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 85,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 86,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 87,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 88,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 89,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 90,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 91,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 92,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 93,
+          "subscription_plan": "annual"
+        },
+        {
+          "player_id": 94,
+          "subscription_plan": "annual"
+        },
+        {
+          "player_id": 95,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 96,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 97,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 98,
+          "subscription_plan": "annual"
+        },
+        {
+          "player_id": 99,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 100,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 101,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 102,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 103,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 104,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 105,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 106,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 107,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 108,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 109,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 110,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 111,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 112,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 113,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 114,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 115,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 116,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 117,
+          "subscription_plan": "annual"
+        },
+        {
+          "player_id": 118,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 119,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 120,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 121,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 122,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 123,
+          "subscription_plan": "annual"
+        },
+        {
+          "player_id": 124,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 125,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 126,
+          "subscription_plan": "annual"
+        },
+        {
+          "player_id": 127,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 128,
+          "subscription_plan": "annual"
+        },
+        {
+          "player_id": 129,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 130,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 131,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 132,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 133,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 134,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 135,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 136,
+          "subscription_plan": "annual"
+        },
+        {
+          "player_id": 137,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 138,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 139,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 140,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 141,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 142,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 143,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 144,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 145,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 146,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 147,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 148,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 149,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 150,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 151,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 152,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 153,
+          "subscription_plan": "annual"
+        },
+        {
+          "player_id": 154,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 155,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 156,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 157,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 158,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 159,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 160,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 161,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 162,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 163,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 164,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 165,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 166,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 167,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 168,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 169,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 170,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 171,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 172,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 173,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 174,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 175,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 176,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 177,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 178,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 179,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 180,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 181,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 182,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 183,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 184,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 185,
+          "subscription_plan": "annual"
+        },
+        {
+          "player_id": 186,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 187,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 188,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 189,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 190,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 191,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 192,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 193,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 194,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 195,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 196,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 197,
+          "subscription_plan": "annual"
+        },
+        {
+          "player_id": 198,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 199,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 200,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 201,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 202,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 203,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 204,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 205,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 206,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 207,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 208,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 209,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 210,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 211,
+          "subscription_plan": "annual"
+        },
+        {
+          "player_id": 212,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 213,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 214,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 215,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 216,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 217,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 218,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 219,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 220,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 221,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 222,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 223,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 224,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 225,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 226,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 227,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 228,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 229,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 230,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 231,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 232,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 233,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 234,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 235,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 236,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 237,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 238,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 239,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 240,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 241,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 242,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 243,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 244,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 245,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 246,
+          "subscription_plan": "annual"
+        },
+        {
+          "player_id": 247,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 248,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 249,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 250,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 251,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 252,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 253,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 254,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 255,
+          "subscription_plan": "annual"
+        },
+        {
+          "player_id": 256,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 257,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 258,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 259,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 260,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 261,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 262,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 263,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 264,
+          "subscription_plan": "annual"
+        },
+        {
+          "player_id": 265,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 266,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 267,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 268,
+          "subscription_plan": "annual"
+        },
+        {
+          "player_id": 269,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 270,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 271,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 272,
+          "subscription_plan": "annual"
+        },
+        {
+          "player_id": 273,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 274,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 275,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 276,
+          "subscription_plan": "annual"
+        },
+        {
+          "player_id": 277,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 278,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 279,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 280,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 281,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 282,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 283,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 284,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 285,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 286,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 287,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 288,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 289,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 290,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 291,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 292,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 293,
+          "subscription_plan": "annual"
+        },
+        {
+          "player_id": 294,
+          "subscription_plan": "annual"
+        },
+        {
+          "player_id": 295,
+          "subscription_plan": "annual"
+        },
+        {
+          "player_id": 296,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 297,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 298,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 299,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 300,
+          "subscription_plan": "free"
+        }
+      ],
+      "fragments": [
+        {
+          "datasource": "billing",
+          "source_sql": "SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\"",
+          "canonical_sql": "SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\"",
+          "output_names": "player_id, subscription_plan",
+          "has_dynamic_filter": false
+        }
+      ],
+      "use_count_before": 0,
+      "use_count_after": 0
+    },
+    {
+      "case": "ordered limited definition",
+      "view": "studio_ordered_boundary",
+      "sql": "SELECT p.player_id, p.subscription_plan FROM billing.public.players AS p ORDER BY p.player_id LIMIT 3",
+      "substituted": false,
+      "plan": [
+        {
+          "plan": "Projection"
+        },
+        {
+          "plan": "  Limit"
+        },
+        {
+          "plan": "    Scan [billing] cost=10.48ms rows=300 stats=defaulted[avg_width] :: SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\" ORDER BY \"p\".\"player_id\" LIMIT 3"
+        }
+      ],
+      "rows": [
+        {
+          "player_id": 1,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 2,
+          "subscription_plan": "free"
+        },
+        {
+          "player_id": 3,
+          "subscription_plan": "free"
+        }
+      ],
+      "fragments": [
+        {
+          "datasource": "billing",
+          "source_sql": "SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\" ORDER BY \"p\".\"player_id\" LIMIT 3",
+          "canonical_sql": "SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\" ORDER BY \"p\".\"player_id\" NULLS LAST LIMIT 3",
+          "output_names": "player_id, subscription_plan",
+          "has_dynamic_filter": false
+        }
+      ],
+      "use_count_before": 0,
+      "use_count_after": 0
+    },
+    {
+      "case": "filtered projection control",
+      "view": "studio_monthly_boundary",
+      "sql": "SELECT p.player_id, p.subscription_plan FROM billing.public.players AS p WHERE p.subscription_plan = 'monthly'",
+      "substituted": true,
+      "plan": [
+        {
+          "plan": "MaterializedScan [studio_monthly_boundary] cost=10.11ms rows=68 stats=defaulted[avg_width] :: SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"studio_monthly_boundary\""
+        }
+      ],
+      "rows": [
+        {
+          "player_id": 8,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 14,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 16,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 18,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 20,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 23,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 24,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 26,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 30,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 35,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 42,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 46,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 48,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 50,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 52,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 59,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 74,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 75,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 78,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 79,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 84,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 88,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 103,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 112,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 119,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 120,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 139,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 140,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 142,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 147,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 151,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 154,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 157,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 163,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 170,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 173,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 177,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 180,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 181,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 184,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 188,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 195,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 200,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 201,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 212,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 213,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 217,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 218,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 222,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 223,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 225,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 226,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 229,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 231,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 234,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 237,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 242,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 243,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 244,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 263,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 271,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 284,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 286,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 288,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 291,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 292,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 296,
+          "subscription_plan": "monthly"
+        },
+        {
+          "player_id": 297,
+          "subscription_plan": "monthly"
+        }
+      ],
+      "fragments": [
+        {
+          "datasource": "accel:/data/projects/fedq-public/tutorials/game-studio/generated/fedq-state/databases/e9c20089-4352-481f-bae2-0676277884d3/materialized",
+          "source_sql": "SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"studio_monthly_boundary\"",
+          "canonical_sql": "SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"studio_monthly_boundary\"",
+          "output_names": "player_id, subscription_plan",
+          "has_dynamic_filter": false
+        }
+      ],
+      "use_count_before": 0,
+      "use_count_after": 1
+    }
+  ],
+  "definitions": {
+    "studio_support_boundary": "SELECT p.subscription_plan,\n       COUNT(DISTINCT p.player_id) AS supported_players,\n       COUNT(*) AS gameplay_tickets,\n       SUM(t.handling_minutes) AS handling_minutes\nFROM billing.public.players AS p\nJOIN crm.support.tickets AS t ON p.player_id = t.player_id\nJOIN (\n    SELECT e.player_id\n    FROM gameplay.gameplay.events AS e\n    WHERE e.event_name = 'session_start'\n    GROUP BY e.player_id\n) AS active ON p.player_id = active.player_id\nWHERE t.category = 'gameplay'\nGROUP BY p.subscription_plan",
+    "studio_disabled_boundary": "SELECT p.subscription_plan,\n       COUNT(DISTINCT p.player_id) AS supported_players,\n       COUNT(*) AS gameplay_tickets,\n       SUM(t.handling_minutes) AS handling_minutes\nFROM billing.public.players AS p\nJOIN crm.support.tickets AS t ON p.player_id = t.player_id\nJOIN (\n    SELECT e.player_id\n    FROM gameplay.gameplay.events AS e\n    WHERE e.event_name = 'session_start'\n    GROUP BY e.player_id\n) AS active ON p.player_id = active.player_id\nWHERE t.category = 'gameplay'\nGROUP BY p.subscription_plan",
+    "studio_players_boundary": "SELECT p.player_id, p.subscription_plan FROM billing.public.players AS p",
+    "studio_ordered_boundary": "SELECT p.player_id, p.subscription_plan FROM billing.public.players AS p ORDER BY p.player_id LIMIT 3",
+    "studio_monthly_boundary": "SELECT p.player_id, p.subscription_plan FROM billing.public.players AS p WHERE p.subscription_plan = 'monthly'"
+  },
+  "views_removed": true
+}

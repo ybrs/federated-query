@@ -333,5 +333,15 @@ def main():
     print("wrote {0}".format(report_path))
 
 
-if __name__ == "__main__":
+def _dispatch():
+    """Run the selected complete benchmark scenario through this sole runner."""
+    if sys.argv[1:2] == ["studio-accelerator"]:
+        from studio_accelerator import main as run_studio_accelerator
+
+        run_studio_accelerator(sys.argv[2:])
+        return
     main()
+
+
+if __name__ == "__main__":
+    _dispatch()

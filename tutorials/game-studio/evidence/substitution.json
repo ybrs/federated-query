@@ -1,0 +1,401 @@
+{
+  "checks": [
+    {
+      "case": "original SELECT",
+      "sql": "SELECT p.subscription_plan,\n       COUNT(DISTINCT p.player_id) AS supported_players,\n       COUNT(*) AS gameplay_tickets,\n       SUM(t.handling_minutes) AS handling_minutes\nFROM billing.public.players AS p\nJOIN crm.support.tickets AS t ON p.player_id = t.player_id\nJOIN (\n    SELECT e.player_id\n    FROM gameplay.gameplay.events AS e\n    WHERE e.event_name = 'session_start'\n    GROUP BY e.player_id\n) AS active ON p.player_id = active.player_id\nWHERE t.category = 'gameplay'\nGROUP BY p.subscription_plan",
+      "substituted": true,
+      "plan": [
+        {
+          "plan": "MaterializedScan [studio_substitution_check] cost=10.01ms rows=3 stats=defaulted[avg_width] :: SELECT \"subscription_plan\", \"supported_players\", \"gameplay_tickets\", \"handling_minutes\" FROM \"public\".\"studio_substitution_check\""
+        }
+      ],
+      "rows": [
+        {
+          "subscription_plan": "annual",
+          "supported_players": 22,
+          "gameplay_tickets": 34,
+          "handling_minutes": 786
+        },
+        {
+          "subscription_plan": "monthly",
+          "supported_players": 53,
+          "gameplay_tickets": 90,
+          "handling_minutes": 2259
+        },
+        {
+          "subscription_plan": "free",
+          "supported_players": 140,
+          "gameplay_tickets": 239,
+          "handling_minutes": 5839
+        }
+      ],
+      "fragments": [
+        {
+          "datasource": "accel:/data/projects/fedq-public/tutorials/game-studio/generated/fedq-state/databases/e9c20089-4352-481f-bae2-0676277884d3/materialized",
+          "source_sql": "SELECT \"subscription_plan\", \"supported_players\", \"gameplay_tickets\", \"handling_minutes\" FROM \"public\".\"studio_substitution_check\"",
+          "canonical_sql": "SELECT \"subscription_plan\", \"supported_players\", \"gameplay_tickets\", \"handling_minutes\" FROM \"public\".\"studio_substitution_check\"",
+          "output_names": "subscription_plan, supported_players, gameplay_tickets, handling_minutes",
+          "has_dynamic_filter": false
+        }
+      ],
+      "use_count_before": 0,
+      "use_count_after": 1
+    },
+    {
+      "case": "keyword case and whitespace",
+      "sql": "select\n  p.subscription_plan,\n       COUNT(DISTINCT p.player_id) AS supported_players,\n       COUNT(*) AS gameplay_tickets,\n       SUM(t.handling_minutes) AS handling_minutes\nFROM billing.public.players AS p\nJOIN crm.support.tickets AS t ON p.player_id = t.player_id\nJOIN (\n    select\n  e.player_id\n    FROM gameplay.gameplay.events AS e\n    WHERE e.event_name = 'session_start'\n    GROUP BY e.player_id\n) AS active ON p.player_id = active.player_id\nWHERE t.category = 'gameplay'\nGROUP BY p.subscription_plan",
+      "substituted": true,
+      "plan": [
+        {
+          "plan": "MaterializedScan [studio_substitution_check] cost=10.01ms rows=3 stats=defaulted[avg_width] :: SELECT \"subscription_plan\", \"supported_players\", \"gameplay_tickets\", \"handling_minutes\" FROM \"public\".\"studio_substitution_check\""
+        }
+      ],
+      "rows": [
+        {
+          "subscription_plan": "annual",
+          "supported_players": 22,
+          "gameplay_tickets": 34,
+          "handling_minutes": 786
+        },
+        {
+          "subscription_plan": "monthly",
+          "supported_players": 53,
+          "gameplay_tickets": 90,
+          "handling_minutes": 2259
+        },
+        {
+          "subscription_plan": "free",
+          "supported_players": 140,
+          "gameplay_tickets": 239,
+          "handling_minutes": 5839
+        }
+      ],
+      "fragments": [
+        {
+          "datasource": "accel:/data/projects/fedq-public/tutorials/game-studio/generated/fedq-state/databases/e9c20089-4352-481f-bae2-0676277884d3/materialized",
+          "source_sql": "SELECT \"subscription_plan\", \"supported_players\", \"gameplay_tickets\", \"handling_minutes\" FROM \"public\".\"studio_substitution_check\"",
+          "canonical_sql": "SELECT \"subscription_plan\", \"supported_players\", \"gameplay_tickets\", \"handling_minutes\" FROM \"public\".\"studio_substitution_check\"",
+          "output_names": "subscription_plan, supported_players, gameplay_tickets, handling_minutes",
+          "has_dynamic_filter": false
+        }
+      ],
+      "use_count_before": 1,
+      "use_count_after": 2
+    },
+    {
+      "case": "different predicate",
+      "sql": "SELECT p.subscription_plan,\n       COUNT(DISTINCT p.player_id) AS supported_players,\n       COUNT(*) AS gameplay_tickets,\n       SUM(t.handling_minutes) AS handling_minutes\nFROM billing.public.players AS p\nJOIN crm.support.tickets AS t ON p.player_id = t.player_id\nJOIN (\n    SELECT e.player_id\n    FROM gameplay.gameplay.events AS e\n    WHERE e.event_name = 'session_start'\n    GROUP BY e.player_id\n) AS active ON p.player_id = active.player_id\nWHERE t.category = 'billing'\nGROUP BY p.subscription_plan",
+      "substituted": false,
+      "plan": [
+        {
+          "plan": "HashAggregate group=[\"p\".\"subscription_plan\"]"
+        },
+        {
+          "plan": "  HashJoin [INNER] keys=(\"p\".\"player_id\" = \"active\".\"player_id\") build=Right rows=9892 stats=defaulted[ndv(t.player_id), eq_selectivity(gameplay.gameplay.events.event_name), group_ndv(gameplay.gameplay.events.player_id), ndv(active.player_id)]"
+        },
+        {
+          "plan": "    HashJoin [INNER] keys=(\"p\".\"player_id\" = \"t\".\"player_id\") build=Left rows=363 stats=defaulted[ndv(t.player_id)]"
+        },
+        {
+          "plan": "      Scan [billing] cost=10.48ms rows=300 stats=defaulted[avg_width] :: SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\""
+        },
+        {
+          "plan": "      Scan [crm] filter=(\"t\".\"player_id\" IN (...)) cost=10.87ms rows=363 stats=defaulted[avg_width] :: SELECT `player_id`, `category`, `handling_minutes` FROM `support`.`tickets` AS `t` WHERE (`t`.`category` = 'billing')"
+        },
+        {
+          "plan": "    AliasedRelation"
+        },
+        {
+          "plan": "      Scan [gameplay] +inject(player_id) cost=23.08ms rows=8176 stats=defaulted[avg_width] :: SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\""
+        }
+      ],
+      "rows": [
+        {
+          "subscription_plan": "free",
+          "supported_players": 47,
+          "gameplay_tickets": 47,
+          "handling_minutes": 1087
+        },
+        {
+          "subscription_plan": "monthly",
+          "supported_players": 22,
+          "gameplay_tickets": 22,
+          "handling_minutes": 581
+        },
+        {
+          "subscription_plan": "annual",
+          "supported_players": 9,
+          "gameplay_tickets": 9,
+          "handling_minutes": 205
+        }
+      ],
+      "fragments": [
+        {
+          "datasource": "billing",
+          "source_sql": "SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\"",
+          "canonical_sql": "SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\"",
+          "output_names": "player_id, subscription_plan",
+          "has_dynamic_filter": false
+        },
+        {
+          "datasource": "crm",
+          "source_sql": "SELECT `player_id`, `category`, `handling_minutes` FROM `support`.`tickets` AS `t` WHERE (`t`.`category` = 'billing')",
+          "canonical_sql": "SELECT \"player_id\", \"category\", \"handling_minutes\" FROM \"support\".\"tickets\" AS \"t\" WHERE (\"t\".\"category\" = 'billing')",
+          "output_names": "player_id, category, handling_minutes",
+          "has_dynamic_filter": true
+        },
+        {
+          "datasource": "gameplay",
+          "source_sql": "SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\"",
+          "canonical_sql": "SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\"",
+          "output_names": "player_id",
+          "has_dynamic_filter": false
+        }
+      ],
+      "use_count_before": 2,
+      "use_count_after": 2
+    },
+    {
+      "case": "different output alias",
+      "sql": "SELECT p.subscription_plan,\n       COUNT(DISTINCT p.player_id) AS supported_players,\n       COUNT(*) AS ticket_count,\n       SUM(t.handling_minutes) AS handling_minutes\nFROM billing.public.players AS p\nJOIN crm.support.tickets AS t ON p.player_id = t.player_id\nJOIN (\n    SELECT e.player_id\n    FROM gameplay.gameplay.events AS e\n    WHERE e.event_name = 'session_start'\n    GROUP BY e.player_id\n) AS active ON p.player_id = active.player_id\nWHERE t.category = 'gameplay'\nGROUP BY p.subscription_plan",
+      "substituted": false,
+      "plan": [
+        {
+          "plan": "HashAggregate group=[\"p\".\"subscription_plan\"]"
+        },
+        {
+          "plan": "  HashJoin [INNER] keys=(\"p\".\"player_id\" = \"active\".\"player_id\") build=Right rows=9892 stats=defaulted[ndv(t.player_id), eq_selectivity(gameplay.gameplay.events.event_name), group_ndv(gameplay.gameplay.events.player_id), ndv(active.player_id)]"
+        },
+        {
+          "plan": "    HashJoin [INNER] keys=(\"p\".\"player_id\" = \"t\".\"player_id\") build=Left rows=363 stats=defaulted[ndv(t.player_id)]"
+        },
+        {
+          "plan": "      Scan [billing] cost=10.48ms rows=300 stats=defaulted[avg_width] :: SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\""
+        },
+        {
+          "plan": "      Scan [crm] filter=(\"t\".\"player_id\" IN (...)) cost=10.87ms rows=363 stats=defaulted[avg_width] :: SELECT `player_id`, `category`, `handling_minutes` FROM `support`.`tickets` AS `t` WHERE (`t`.`category` = 'gameplay')"
+        },
+        {
+          "plan": "    AliasedRelation"
+        },
+        {
+          "plan": "      Scan [gameplay] +inject(player_id) cost=23.08ms rows=8176 stats=defaulted[avg_width] :: SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\""
+        }
+      ],
+      "rows": [
+        {
+          "subscription_plan": "annual",
+          "supported_players": 22,
+          "ticket_count": 34,
+          "handling_minutes": 786
+        },
+        {
+          "subscription_plan": "monthly",
+          "supported_players": 53,
+          "ticket_count": 90,
+          "handling_minutes": 2259
+        },
+        {
+          "subscription_plan": "free",
+          "supported_players": 140,
+          "ticket_count": 239,
+          "handling_minutes": 5839
+        }
+      ],
+      "fragments": [
+        {
+          "datasource": "billing",
+          "source_sql": "SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\"",
+          "canonical_sql": "SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\"",
+          "output_names": "player_id, subscription_plan",
+          "has_dynamic_filter": false
+        },
+        {
+          "datasource": "crm",
+          "source_sql": "SELECT `player_id`, `category`, `handling_minutes` FROM `support`.`tickets` AS `t` WHERE (`t`.`category` = 'gameplay')",
+          "canonical_sql": "SELECT \"player_id\", \"category\", \"handling_minutes\" FROM \"support\".\"tickets\" AS \"t\" WHERE (\"t\".\"category\" = 'gameplay')",
+          "output_names": "player_id, category, handling_minutes",
+          "has_dynamic_filter": true
+        },
+        {
+          "datasource": "gameplay",
+          "source_sql": "SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\"",
+          "canonical_sql": "SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\"",
+          "output_names": "player_id",
+          "has_dynamic_filter": false
+        }
+      ],
+      "use_count_before": 2,
+      "use_count_after": 2
+    },
+    {
+      "case": "outer ordering",
+      "sql": "SELECT review.* FROM (SELECT p.subscription_plan,\n       COUNT(DISTINCT p.player_id) AS supported_players,\n       COUNT(*) AS gameplay_tickets,\n       SUM(t.handling_minutes) AS handling_minutes\nFROM billing.public.players AS p\nJOIN crm.support.tickets AS t ON p.player_id = t.player_id\nJOIN (\n    SELECT e.player_id\n    FROM gameplay.gameplay.events AS e\n    WHERE e.event_name = 'session_start'\n    GROUP BY e.player_id\n) AS active ON p.player_id = active.player_id\nWHERE t.category = 'gameplay'\nGROUP BY p.subscription_plan) AS review ORDER BY review.subscription_plan",
+      "substituted": true,
+      "plan": [
+        {
+          "plan": "Sort"
+        },
+        {
+          "plan": "  Projection"
+        },
+        {
+          "plan": "    AliasedRelation"
+        },
+        {
+          "plan": "      MaterializedScan [studio_substitution_check] cost=10.01ms rows=3 stats=defaulted[avg_width] :: SELECT \"subscription_plan\", \"supported_players\", \"gameplay_tickets\", \"handling_minutes\" FROM \"public\".\"studio_substitution_check\""
+        }
+      ],
+      "rows": [
+        {
+          "subscription_plan": "annual",
+          "supported_players": 22,
+          "gameplay_tickets": 34,
+          "handling_minutes": 786
+        },
+        {
+          "subscription_plan": "free",
+          "supported_players": 140,
+          "gameplay_tickets": 239,
+          "handling_minutes": 5839
+        },
+        {
+          "subscription_plan": "monthly",
+          "supported_players": 53,
+          "gameplay_tickets": 90,
+          "handling_minutes": 2259
+        }
+      ],
+      "fragments": [
+        {
+          "datasource": "accel:/data/projects/fedq-public/tutorials/game-studio/generated/fedq-state/databases/e9c20089-4352-481f-bae2-0676277884d3/materialized",
+          "source_sql": "SELECT \"subscription_plan\", \"supported_players\", \"gameplay_tickets\", \"handling_minutes\" FROM \"public\".\"studio_substitution_check\"",
+          "canonical_sql": "SELECT \"subscription_plan\", \"supported_players\", \"gameplay_tickets\", \"handling_minutes\" FROM \"public\".\"studio_substitution_check\"",
+          "output_names": "subscription_plan, supported_players, gameplay_tickets, handling_minutes",
+          "has_dynamic_filter": false
+        }
+      ],
+      "use_count_before": 2,
+      "use_count_after": 3
+    },
+    {
+      "case": "session disabled",
+      "sql": "SELECT p.subscription_plan,\n       COUNT(DISTINCT p.player_id) AS supported_players,\n       COUNT(*) AS gameplay_tickets,\n       SUM(t.handling_minutes) AS handling_minutes\nFROM billing.public.players AS p\nJOIN crm.support.tickets AS t ON p.player_id = t.player_id\nJOIN (\n    SELECT e.player_id\n    FROM gameplay.gameplay.events AS e\n    WHERE e.event_name = 'session_start'\n    GROUP BY e.player_id\n) AS active ON p.player_id = active.player_id\nWHERE t.category = 'gameplay'\nGROUP BY p.subscription_plan",
+      "substituted": false,
+      "plan": [
+        {
+          "plan": "HashAggregate group=[\"p\".\"subscription_plan\"]"
+        },
+        {
+          "plan": "  HashJoin [INNER] keys=(\"p\".\"player_id\" = \"active\".\"player_id\") build=Right rows=9892 stats=defaulted[ndv(t.player_id), eq_selectivity(gameplay.gameplay.events.event_name), group_ndv(gameplay.gameplay.events.player_id), ndv(active.player_id)]"
+        },
+        {
+          "plan": "    HashJoin [INNER] keys=(\"p\".\"player_id\" = \"t\".\"player_id\") build=Left rows=363 stats=defaulted[ndv(t.player_id)]"
+        },
+        {
+          "plan": "      Scan [billing] cost=10.48ms rows=300 stats=defaulted[avg_width] :: SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\""
+        },
+        {
+          "plan": "      Scan [crm] filter=(\"t\".\"player_id\" IN (...)) cost=10.87ms rows=363 stats=defaulted[avg_width] :: SELECT `player_id`, `category`, `handling_minutes` FROM `support`.`tickets` AS `t` WHERE (`t`.`category` = 'gameplay')"
+        },
+        {
+          "plan": "    AliasedRelation"
+        },
+        {
+          "plan": "      Scan [gameplay] +inject(player_id) cost=23.08ms rows=8176 stats=defaulted[avg_width] :: SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\""
+        }
+      ],
+      "rows": [
+        {
+          "subscription_plan": "free",
+          "supported_players": 140,
+          "gameplay_tickets": 239,
+          "handling_minutes": 5839
+        },
+        {
+          "subscription_plan": "annual",
+          "supported_players": 22,
+          "gameplay_tickets": 34,
+          "handling_minutes": 786
+        },
+        {
+          "subscription_plan": "monthly",
+          "supported_players": 53,
+          "gameplay_tickets": 90,
+          "handling_minutes": 2259
+        }
+      ],
+      "fragments": [
+        {
+          "datasource": "billing",
+          "source_sql": "SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\"",
+          "canonical_sql": "SELECT \"player_id\", \"subscription_plan\" FROM \"public\".\"players\" AS \"p\"",
+          "output_names": "player_id, subscription_plan",
+          "has_dynamic_filter": false
+        },
+        {
+          "datasource": "crm",
+          "source_sql": "SELECT `player_id`, `category`, `handling_minutes` FROM `support`.`tickets` AS `t` WHERE (`t`.`category` = 'gameplay')",
+          "canonical_sql": "SELECT \"player_id\", \"category\", \"handling_minutes\" FROM \"support\".\"tickets\" AS \"t\" WHERE (\"t\".\"category\" = 'gameplay')",
+          "output_names": "player_id, category, handling_minutes",
+          "has_dynamic_filter": true
+        },
+        {
+          "datasource": "gameplay",
+          "source_sql": "SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\"",
+          "canonical_sql": "SELECT \"e\".\"player_id\" AS \"player_id\" FROM \"gameplay\".\"events\" AS \"e\" WHERE (\"e\".\"event_name\" = 'session_start') GROUP BY \"e\".\"player_id\"",
+          "output_names": "player_id",
+          "has_dynamic_filter": false
+        }
+      ],
+      "use_count_before": 3,
+      "use_count_after": 3
+    },
+    {
+      "case": "session reset",
+      "sql": "SELECT p.subscription_plan,\n       COUNT(DISTINCT p.player_id) AS supported_players,\n       COUNT(*) AS gameplay_tickets,\n       SUM(t.handling_minutes) AS handling_minutes\nFROM billing.public.players AS p\nJOIN crm.support.tickets AS t ON p.player_id = t.player_id\nJOIN (\n    SELECT e.player_id\n    FROM gameplay.gameplay.events AS e\n    WHERE e.event_name = 'session_start'\n    GROUP BY e.player_id\n) AS active ON p.player_id = active.player_id\nWHERE t.category = 'gameplay'\nGROUP BY p.subscription_plan",
+      "substituted": true,
+      "plan": [
+        {
+          "plan": "MaterializedScan [studio_substitution_check] cost=10.01ms rows=3 stats=defaulted[avg_width] :: SELECT \"subscription_plan\", \"supported_players\", \"gameplay_tickets\", \"handling_minutes\" FROM \"public\".\"studio_substitution_check\""
+        }
+      ],
+      "rows": [
+        {
+          "subscription_plan": "annual",
+          "supported_players": 22,
+          "gameplay_tickets": 34,
+          "handling_minutes": 786
+        },
+        {
+          "subscription_plan": "monthly",
+          "supported_players": 53,
+          "gameplay_tickets": 90,
+          "handling_minutes": 2259
+        },
+        {
+          "subscription_plan": "free",
+          "supported_players": 140,
+          "gameplay_tickets": 239,
+          "handling_minutes": 5839
+        }
+      ],
+      "fragments": [
+        {
+          "datasource": "accel:/data/projects/fedq-public/tutorials/game-studio/generated/fedq-state/databases/e9c20089-4352-481f-bae2-0676277884d3/materialized",
+          "source_sql": "SELECT \"subscription_plan\", \"supported_players\", \"gameplay_tickets\", \"handling_minutes\" FROM \"public\".\"studio_substitution_check\"",
+          "canonical_sql": "SELECT \"subscription_plan\", \"supported_players\", \"gameplay_tickets\", \"handling_minutes\" FROM \"public\".\"studio_substitution_check\"",
+          "output_names": "subscription_plan, supported_players, gameplay_tickets, handling_minutes",
+          "has_dynamic_filter": false
+        }
+      ],
+      "use_count_before": 3,
+      "use_count_after": 4
+    }
+  ],
+  "invalid_query": {
+    "invalid_column_rejected": true,
+    "use_count_unchanged": true
+  },
+  "view_removed": true
+}

@@ -92,6 +92,10 @@ listed file's contents are seen on the next query.
 For daily Firebase exports, nested fields, and UNNEST, see
 [Firebase Parquet CLI workflow](doc/firebase-parquet.md).
 
+For a complete example joining ClickHouse gameplay, PostgreSQL billing,
+MySQL support, and Parquet acquisition data, see the
+[game studio showcase](tutorials/game-studio/README.md).
+
 ## Query features
 
 - Federated queries across multiple sources.
